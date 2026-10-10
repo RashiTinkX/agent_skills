@@ -69,6 +69,8 @@ synthscholar/
 │   └── data_model.md            # SLR ontology + DB schema + provenance values
 └── scripts/
     ├── validate_protocol.py     # scaffold + completeness-gate a protocol file
+    ├── generate_search_strategy.py  # question → deterministic PubMed query (+ count/fetch)
+    ├── search_strategy/         #   └─ engine from sensein/search-strategy-generator
     ├── build_corpus.py          # PDFs → corpus.json (full text, hashes, provenance)
     ├── fetch_ezproxy.py         # DOIs → PDFs: open access first, institutional second
     ├── oa_client.py             #   └─ vendored Unpaywall → OpenAlex → Semantic Scholar
@@ -94,6 +96,10 @@ synthscholar/
 # Intake: scaffold a protocol, fill it, gate it before running
 python scripts/validate_protocol.py --print-template > protocol.json
 python scripts/validate_protocol.py protocol.json
+
+# Search strategy: question → MeSH-grounded PubMed query
+python scripts/generate_search_strategy.py --build-index /path/to/mesh.nt   # one-time
+python scripts/generate_search_strategy.py "vocal biomarkers for depression" --count
 
 # BYO corpus: PDFs → review.md + review.ttl
 python scripts/build_corpus.py --dir ./pdfs --out corpus.json
@@ -158,6 +164,7 @@ pip install -e /path/to/prisma-review-agent    # the checkout, not `pip install 
 | Script | Runs on released 0.0.11? |
 | --- | --- |
 | `validate_protocol.py`, `build_corpus.py`, `update_provenance.py` | yes — no app import, or models only |
+| `generate_search_strategy.py` | yes — no app import; needs `requests`, `httpx` and a local MeSH index |
 | `fetch_ezproxy.py` | yes — the skill vendors `oa_client.py` and `ezproxy_client.py`, so it needs only `httpx` |
 | `export_review.py`, `run_local_review.py` | **no** — they refuse to run and say what's missing |
 

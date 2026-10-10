@@ -7,6 +7,7 @@ interface:
   capabilities:
     - "Draft and gate a complete review protocol from a one-line research question"
     - "Run the full PRISMA pipeline over user-supplied PDFs: screening, charting, appraisal, synthesis, per-group analysis"
+    - "Generate a deterministic, MeSH-grounded PubMed search strategy from a research question, count and fetch its hits"
     - "Retrieve missing full texts from a DOI — open access (Unpaywall/OpenAlex/Semantic Scholar), then institutional EZproxy"
     - "Read every paper in full and extract only that paper's own findings, not the claims it cites"
     - "Screen eligibility on full text, recording what each decision was actually judged on"
@@ -49,6 +50,7 @@ dependencies:
   # Which scripts need which of the above.
   scripts:
     validate_protocol.py: "stdlib only (PyYAML optional, for .yaml protocols)"
+    generate_search_strategy.py: "requests + httpx; a local MeSH index (--build-index); OPENROUTER_API_KEY except --mode mesh_only"
     build_corpus.py: "docling first (tables + OCR, the only backend that reads a scanned PDF), then pymupdf, pypdf, the pdftotext CLI; --no-docling skips it"
     fetch_ezproxy.py: "httpx; open access needs no credentials; institutional access signs in through a browser (playwright) — no EZPROXY_* setup"
     ezproxy_login.py: "playwright + Chrome/Edge (or playwright's Chromium); saves the session under ~/.config/synthscholar"
@@ -68,7 +70,10 @@ dependencies:
     backfill_full_text.py: "psycopg[binary] + synthscholar, migration 006 applied"
 
   environment:
-    OPENROUTER_API_KEY: "required by run_local_review.py; unused by the other scripts"
+    OPENROUTER_API_KEY: "required by run_local_review.py and generate_search_strategy.py (except --mode mesh_only)"
+    OPENROUTER_MODEL: "optional; default model for generate_search_strategy.py"
+    NCBI_API_KEY: "optional; raises the PubMed E-utilities rate limit (generate_search_strategy.py)"
+    NCBI_EMAIL: "optional; contact address sent to NCBI (generate_search_strategy.py)"
     SYNTHSCHOLAR_EMAIL: "polite-pool contact; Unpaywall requires it (ToS) and is skipped without it"
     NCBI_API_KEY: "optional; raises the PubMed E-utilities rate limit for verify_citations.py"
     SEMANTIC_SCHOLAR_API_KEY: "optional; lifts Semantic Scholar's 1 req/s public rate limit"
