@@ -199,18 +199,22 @@ def svg_to_pdf(svg: Path, pdf: Path) -> Optional[str]:
     return None
 
 
+def load_flow_dict(flow: object) -> Optional[dict]:
+    """``flow`` if it holds counts worth drawing, else None."""
+    if not isinstance(flow, dict) or not any(
+            int(flow.get(k) or 0) for k in ("total_identified", "screened_title_abstract",
+                                             "assessed_eligibility", "included_synthesis")):
+        return None
+    return flow
+
+
 def load_flow(review_json: Path) -> Optional[dict]:
     """The review's flow counts, or None when there is nothing to draw."""
     try:
         data = json.loads(review_json.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    flow = data.get("flow") if isinstance(data, dict) else None
-    if not isinstance(flow, dict) or not any(
-            int(flow.get(k) or 0) for k in ("total_identified", "screened_title_abstract",
-                                             "assessed_eligibility", "included_synthesis")):
-        return None
-    return flow
+    return load_flow_dict(data.get("flow") if isinstance(data, dict) else None)
 
 
 def main() -> int:

@@ -36,6 +36,7 @@ modes:
 | **Answer the review's research questions, per study and per question** | `research_questions.py` (automatic) | The protocol's questions are charted per article, then organised question-first into every export: a Markdown appendix, a `research_questions` JSON block, and `slr:ResearchQuestion` nodes you can query without string-matching an id. |
 | **Make the prose read as a formal review, not AI text** | `check_writing.py` | Flags the review's own sentences that carry AI-writing patterns or an informal register: "delve" or "landscape", stacked hedges, "significant" without a test, "numerous studies" without a count, causal overclaims, contractions, chatbot artifacts. The agent then rewrites them in `review.json` per `references/writing_style.md`. Quoted evidence, numbers and citations are never touched. |
 | **Verify every citation** | `verify_citations.py` | DOIs and PMIDs checked against Crossref / DataCite / PubMed: real, pointing at the paper the review names (title, author, year compared), not retracted. Every in-text PMID / DOI / author–year must be an included study. Registry-confirmed fixes with `--apply`; a reference list in APA / Nature / Vancouver / IEEE with `--style`. |
+| **Write it as a paper** | `assemble_manuscript.py` + `review_figures.py` | The review assembled in the template's section order (`references/review_template.md`, systematic or scoping variant): numbered without gaps; a full Discussion; figures drawn from the data, placed and discussed; per-record appendices moved to sibling files; a 50-page cap; and export gates that say what is still missing. |
 | **Get the review as a PDF** | `generate_review_pdf.py` | pandoc + any of xelatex / lualatex / tectonic / typst / weasyprint. Includes a drawn PRISMA 2020 flow diagram (`prisma_flow.py`), and fits every image to the page so none is cut off. Title and section numbering kept, wide tables wrapped, verified reference list swapped in (`--references`), charting / per-group / citation report appended (`--include`), a Unicode font chosen for TeX engines. Refuses while the citation report has errors or predates the Markdown. |
 | **Add the search strategy after the fact** | `update_provenance.py` | Databases, query strings, dates, filters, record counts, registration ID — patched in and re-exported, so a run is never blocked on paperwork. |
 | **Interrogate a finished review** | `query_sparql.py` (16 recipes), `query_postgres.py` (8) | Full-text vs abstract-only inclusions, retrieval routes, reading basis, screening decisions, exclusion reasons, research-question answers, EZproxy-sourced articles, full-text search over the store. |
@@ -59,6 +60,7 @@ synthscholar/
 │   ├── byo_corpus_review.md     # user-supplied-PDF workflow, schemas, PRISMA flow rules
 │   ├── citation_verification.md # citation checks, finding codes → actions, styles
 │   ├── writing_style.md         # formal review register; AI patterns to rewrite
+│   ├── review_template.md       # the manuscript section plan, budgets, figures, gates
 │   ├── sparql_queries.md        # SPARQL recipe catalog
 │   ├── sql_queries.md           # SQL recipe catalog
 │   └── data_model.md            # SLR ontology + DB schema + provenance values
@@ -74,7 +76,9 @@ synthscholar/
     ├── update_provenance.py     # add the search strategy later, then re-export
     ├── check_writing.py         # AI-voice / informal-register patterns in the review's prose
     ├── verify_citations.py      # DOIs/PMIDs vs registries, retractions, in-text citations
-    ├── generate_review_pdf.py   # review.md (+ appendices) → PDF via pandoc
+    ├── assemble_manuscript.py   # review.json + review.manuscript.json → the paper (template gates)
+    ├── review_figures.py        #   └─ the standard figures, drawn from the data (SVG)
+    ├── generate_review_pdf.py   # manuscript → .tex → PDF (page-limit guard)
     ├── prisma_flow.py           #   └─ PRISMA 2020 flow diagram (SVG / PDF) from the flow counts
     ├── query_sparql.py          # run recipes against a .ttl / .jsonld export
     ├── query_postgres.py        # run recipes against the article store DB
@@ -117,7 +121,8 @@ python scripts/verify_citations.py out/review.json
 python scripts/verify_citations.py out/review.json --apply out/review.verified.json --style apa
 
 # PDF of the review, verified references swapped in, charting + citation report appended
-python scripts/generate_review_pdf.py out/review.md --references apa --include charting citations
+python scripts/assemble_manuscript.py out/review.json --check
+python scripts/generate_review_pdf.py out/review.manuscript.md
 
 # List available named queries
 python scripts/query_sparql.py --list

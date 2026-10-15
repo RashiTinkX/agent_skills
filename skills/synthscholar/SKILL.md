@@ -1,6 +1,6 @@
 ---
 name: synthscholar
-version: 0.5.0
+version: 0.6.0
 description: Set up, run, and query SynthScholar / PRISMA systematic reviews. (1) Protocol intake — draft a complete protocol (research question, PICO, eligibility, databases, risk-of-bias tool, charting, per-group analysis, registration) and validate it before a run. (2) Provenance queries over a finished review — full-text vs abstract-only inclusions, retrieval routes, and the screening audit trail (decisions on full text vs abstract, exclusion reasons per stage), via SPARQL over the RDF export or SQL over the article store. (3) Bring-your-own-corpus review — the user supplies PDFs, or DOIs whose full text is fetched open access (Unpaywall, OpenAlex, Semantic Scholar) then via their own institutional EZproxy access; produces the full PRISMA review (screening, charting, appraisal, synthesis) as Markdown and SLR-ontology Turtle. Use when asked to start or scope a review, run a review over supplied PDFs, get full text for a DOI, export a review to md/ttl, or audit full-text and screening provenance.
 license: Apache-2.0
 ---
@@ -178,12 +178,19 @@ python scripts/verify_citations.py out/review.json --apply out/review.verified.j
 python scripts/export_review.py out/review.verified.json --outdir out/ --formats md ttl json
 python scripts/verify_citations.py out/review.json --style vancouver
 
-# 7. PDF (optional) — refuses while out/review.citations.json has errors or
-#    is older than out/review.md. Draws the PRISMA 2020 flow diagram from
-#    out/review.json under the PRISMA Flow heading, and fits every image to
-#    the page.
-python scripts/generate_review_pdf.py out/review.md --references vancouver \
-    --include charting per-group citations
+# 7. Manuscript — the paper, in the template's order (references/review_template.md).
+#    Draw the figures, write out/review.manuscript.json (Discussion 4.1–4.8,
+#    prior reviews, gaps, confidence, figure interpretations, declarations),
+#    assemble, and clear the gates. Re-run check_writing on the manuscript.
+python scripts/export_review.py out/review.json --outdir out/ --formats md ttl json charting appraisal per-group
+python scripts/review_figures.py out/review.json                 # out/figures/*.svg + figures.json
+python scripts/assemble_manuscript.py out/review.json --check    # out/review.manuscript.md
+python scripts/check_writing.py out/review.manuscript.md
+
+# 8. PDF — Markdown → LaTeX → PDF (the .tex is kept). Builds the manuscript,
+#    refuses past page_limit (estimated before rendering, counted after), and
+#    while out/review.citations.json has errors or is older than the review.
+python scripts/generate_review_pdf.py out/review.manuscript.md
 ```
 
 Step 4 needs `OPENROUTER_API_KEY` and the `synthscholar` package — it drives
@@ -209,7 +216,53 @@ python scripts/research_questions.py out/review.json --outdir out/
 python scripts/research_questions.py out/review.json --outdir out/ --themes themes.json
 ```
 
+### Report structure and length
+
+The final review is the **assembled manuscript**, `review.manuscript.md`.
+It follows
+[references/review_template.md](references/review_template.md): the
+section order, per-section source slots, word and page budgets, the figure
+plan and the export gates. It comes in two variants, set by `review_type`:
+`effect` for systematic reviews (GRADE, optional meta-analysis) and
+`mapping` for scoping reviews, systematic maps and resource surveys. The
+data stays in `review.json`. The prose that makes it a paper goes in
+`review.manuscript.json`: Discussion §4.1–4.8, prior reviews, gaps, the
+confidence statement, figure interpretations and declarations.
+`assemble_manuscript.py` renders the two. The pipeline's raw `review.md`
+is an export, not the paper.
+
+Hard rules:
+
+- **50 pages maximum** (`page_limit`). Per-record material is exported as
+  sibling files and linked, never inlined: full charting tables, evidence
+  spans, URL checks, the excluded list, the resource ↔ publication map. The
+  PDF builder refuses a document over the limit before rendering, so a
+  1,300-page PDF cannot happen. Fix an overrun by moving appendices out,
+  never by cutting the Discussion.
+- **No empty declared section.** Every heading is emitted, numbered without
+  gaps. A section with no data says "Not assessed: <reason>". The
+  Discussion's principal findings, interpretation, comparison, implications
+  and research agenda, and the Conclusions, are mandatory.
+- **Figures where a human author would put them.** `review_figures.py`
+  draws the standard set, and only when the data supports each figure. Its
+  `facts` give the numbers: write each figure's interpretation from them,
+  and refer to it in the section's prose as `{fig:<id>}`. The assembler
+  numbers the figures and places each under the paragraph that introduces
+  it. No decorative charts, and at most 10 to 12.
+- **For resource and landscape surveys (`mapping`)**, the primary unit is
+  the *system*, not the publication. §3.3 renders the deduplicated
+  inventory, and every count in the body says whether it counts resources
+  or publications.
+
 ### Rules for this mode
+
+- **Write the Discussion, not just the limitations.** A review whose
+  Discussion is a limitations list has not been synthesised. Principal
+  findings per research question, interpretation, comparison with prior
+  reviews, implications and a research agenda are required (template §4).
+- **Keep the manuscript a manuscript.** Check the page estimate
+  (`assemble_manuscript.py --check`) before building the PDF. Move
+  appendices to sibling files rather than cutting synthesis.
 
 - **Complete the corpus metadata yourself** from each entry's `_head_text` —
   don't hand the user a list of fields to fill. Never invent a DOI or year;
@@ -446,7 +499,7 @@ step can't run and carry on with the rest.
 | `build_corpus.py` | `pymupdf`; `docling` optional | `python -c "import fitz"` | `pip install pymupdf` (+ `pip install docling` for scans/tables) |
 | `export_review.py`, `run_local_review.py`, `update_provenance.py` | `synthscholar` dev checkout | the script refuses with a message | `pip install -e /path/to/prisma-review-agent` (ask for the path) |
 | `generate_review_pdf.py` | `pandoc` + one PDF engine; `fc-list` optional | `python scripts/generate_review_pdf.py --check-deps` | `conda install -c conda-forge pandoc typst` (or `tectonic`); `brew install pandoc` / `apt-get install pandoc` without conda |
-| `validate_protocol.py`, `research_questions.py`, `check_writing.py` | stdlib | — | — |
+| `validate_protocol.py`, `research_questions.py`, `check_writing.py`, `review_figures.py`, `assemble_manuscript.py` | stdlib | — | — |
 
 Network services (Crossref, PubMed, Unpaywall) and `OPENROUTER_API_KEY` are
 not installs: mention them if a run will need them, and ask the user for any
@@ -486,7 +539,8 @@ python scripts/update_provenance.py out/review.json --provenance search_provenan
 python scripts/check_writing.py out/review.json                        # AI-voice / register pass
 python scripts/verify_citations.py out/review.json                     # citation gate
 python scripts/verify_citations.py out/review.json --style apa --apply out/review.verified.json
-python scripts/generate_review_pdf.py out/review.md --references apa --include charting citations
+python scripts/assemble_manuscript.py out/review.json --check
+python scripts/generate_review_pdf.py out/review.manuscript.md
 python scripts/generate_review_pdf.py --check-deps                     # pandoc + engine?
 
 # SPARQL over an RDF export — named recipe or your own query
@@ -517,6 +571,11 @@ scripts) to see every named recipe.
 - [references/citation_verification.md](references/citation_verification.md) —
   what `verify_citations.py` checks, every finding code with the action it
   calls for, `--apply` semantics, and the reference styles.
+- [references/review_template.md](references/review_template.md) — the
+  manuscript section plan, for both the `effect` and `mapping` variants: the
+  source slot, required content, word and page budget and export gate for
+  every section, the figure plan, the 50-page appendix policy, and the
+  `review.manuscript.json` schema.
 - [references/writing_style.md](references/writing_style.md) — the formal
   register the review's prose must meet: review-specific rules (study counts,
   attribution, GRADE wording), the AI-writing patterns `check_writing.py`

@@ -371,6 +371,24 @@ Write every prose field in the formal register of
 It is cheaper than rewriting afterwards. Then run
 `python scripts/check_writing.py review.json` before exporting.
 
+**The paper is assembled from two files.** `review.json` holds the data the
+exporters understand. `review.manuscript.json` holds what makes it a paper
+([review_template.md](review_template.md), schema at the end), and must
+fill:
+- `discussion` (all of 4.1–4.8);
+- `conclusions`;
+- `gaps`, at least five, each with a number;
+- `prior_reviews`, or a "none identified" statement;
+- `abstract`, at least 250 words, with the reading basis;
+- the per-question `results.rq` syntheses;
+- each figure's interpretation.
+
+The app's review model drops fields it doesn't know, so none of these go in
+`review.json`: a re-export would delete them. Run
+`export_review.py review.json --check` before `--outdir`. It reports the
+completeness checks and the template gates together. Then run
+`assemble_manuscript.py review.json --check` until no gate fails.
+
 ```bash
 python scripts/export_review.py --print-template > review.json   # valid example
 # …replace the EXAMPLE content with the real review…
@@ -536,11 +554,34 @@ change: [citation_verification.md](citation_verification.md).
 ```bash
 python scripts/generate_review_pdf.py --check-deps
 python scripts/verify_citations.py out/review.json --style vancouver   # after the last export
-python scripts/generate_review_pdf.py out/review.md --references vancouver \
-    --include charting per-group citations -o out/review.pdf
+python scripts/review_figures.py out/review.json
+python scripts/assemble_manuscript.py out/review.json --check
+python scripts/generate_review_pdf.py out/review.manuscript.md -o out/review.pdf
 ```
 
-The script renders `review.md` through pandoc without changing its content:
+**Build the manuscript, not the raw export.** `review.manuscript.md` is the
+paper. The raw `review.md` inlines every record and is what produced
+1,000-page PDFs. Given `review.md`, the builder switches to the manuscript
+beside it, if there is one, and warns otherwise.
+
+**LaTeX route.** On a TeX engine (xelatex, lualatex, tectonic, pdflatex):
+- pandoc writes a standalone `.tex`, kept next to the PDF so every page's
+  source can be inspected or edited;
+- the engine compiles it, running twice for xelatex, lualatex and pdflatex;
+- SVG figures are converted to PDF first, and image paths are made
+  absolute;
+- figures stay where the text puts them, with their captions underneath:
+  they are not floated away.
+
+Typst and the HTML engines are the fallbacks.
+
+**Page guard.** The page count is estimated before rendering (words/550 +
+table rows/45 + 0.4 per image). Over `--page-limit` (default 50), the
+builder stops and names the heaviest sections. After rendering, the real
+count is read from the PDF and enforced again. `--allow-over-limit`
+overrides both.
+
+The script renders the Markdown through pandoc without changing its content:
 - the `# title` becomes the PDF title, and the review's own section numbers are
   kept (`--number-sections` would double them);
 - `--references <style>` swaps in the verified list from `verify_citations.py --style`;
