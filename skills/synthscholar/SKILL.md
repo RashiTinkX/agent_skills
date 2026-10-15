@@ -179,7 +179,9 @@ python scripts/export_review.py out/review.verified.json --outdir out/ --formats
 python scripts/verify_citations.py out/review.json --style vancouver
 
 # 7. PDF (optional) — refuses while out/review.citations.json has errors or
-#    is older than out/review.md
+#    is older than out/review.md. Draws the PRISMA 2020 flow diagram from
+#    out/review.json under the PRISMA Flow heading, and fits every image to
+#    the page.
 python scripts/generate_review_pdf.py out/review.md --references vancouver \
     --include charting per-group citations
 ```

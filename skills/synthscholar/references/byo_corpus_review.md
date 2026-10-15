@@ -548,6 +548,21 @@ The script renders `review.md` through pandoc without changing its content:
   whose title already heads a section of `review.md` is skipped: `appraisal`
   repeats the review's own *Appendix C*.
 
+**The PRISMA 2020 flow diagram is drawn and placed automatically.** It goes
+under the review's *PRISMA Flow* heading, above the counts table, which
+stays. The counts come from the review's `flow` (`<stem>.json` beside the
+Markdown, or `--flow-json`), with one line per identification source and
+per exclusion reason. `scripts/prisma_flow.py out/review.json --pdf` draws
+it on its own as an SVG and a PDF. Typst and the HTML engines embed the
+SVG; TeX engines need it converted, through rsvg-convert, cairosvg or
+typst. If none of those is installed, the build warns and omits the
+diagram; ask before installing one. `--no-flow-diagram` turns it off.
+
+**No image is cut off.** Each local image's real size is read: PNG, JPEG,
+GIF, SVG or PDF. Only one that would run past the A4 text block gets a cap:
+the text width, or 23 cm tall. Smaller images keep their natural size, and
+a width or height the author already set is never changed.
+
 Cell line breaks (`<br>`), `---` separators and the `✓ ✗ ⚠` symbols are
 rewritten for each engine, so tables keep their rows and the symbols print. On
 TeX engines a font covering the review's characters (`≥ μ κ →` …) is chosen
