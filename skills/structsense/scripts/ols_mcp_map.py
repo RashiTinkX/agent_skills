@@ -101,7 +101,9 @@ class OlsMcpMapper:
                 text = "".join(c.get("text", "") for c in res.get("content") or [] if c.get("type") == "text")
                 if res.get("isError"):
                     raise OlsMcpError(f"{tool}: {text[:200]}")
-                return json.loads(text) if text.strip()[:1] in "[{" else text
+                head = text.strip()[:1]
+                # "" is in every string: an empty result (no hits) must not reach json.loads.
+                return json.loads(text) if head and head in "[{" else text
             except (urllib.error.URLError, TimeoutError, OlsMcpError, json.JSONDecodeError) as e:
                 logger.warning("OLS MCP %s failed (%s); retrying", tool, e)
                 self._sid = None  # a stale session is the usual cause; start a new one
