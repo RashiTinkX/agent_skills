@@ -37,7 +37,7 @@ modes:
 | **Make the prose read as a formal review, not AI text** | `check_writing.py` | Flags the review's own sentences that carry AI-writing patterns or an informal register: "delve" or "landscape", stacked hedges, "significant" without a test, "numerous studies" without a count, causal overclaims, contractions, chatbot artifacts. The agent then rewrites them in `review.json` per `references/writing_style.md`. Quoted evidence, numbers and citations are never touched. |
 | **Verify every citation** | `verify_citations.py` | DOIs and PMIDs checked against Crossref / DataCite / PubMed: real, pointing at the paper the review names (title, author, year compared), not retracted. Every in-text PMID / DOI / author–year must be an included study. Registry-confirmed fixes with `--apply`; a reference list in APA / Nature / Vancouver / IEEE with `--style`. |
 | **Write it as a paper** | `assemble_manuscript.py` + `review_figures.py` | The review assembled in the template's section order (`references/review_template.md`, systematic or scoping variant): numbered without gaps; a full Discussion; figures drawn from the data, placed and discussed; per-record appendices moved to sibling files; a 50-page cap; and export gates that say what is still missing. |
-| **Get the review as a PDF** | `generate_review_pdf.py` | pandoc + any of xelatex / lualatex / tectonic / typst / weasyprint. Includes a drawn PRISMA 2020 flow diagram (`prisma_flow.py`), and fits every image to the page so none is cut off. Title and section numbering kept, wide tables wrapped, verified reference list swapped in (`--references`), charting / per-group / citation report appended (`--include`), a Unicode font chosen for TeX engines. Refuses while the citation report has errors or predates the Markdown. |
+| **Get the review as a PDF** | `generate_review_pdf.py` | pandoc + a TeX engine (xelatex / lualatex / pdflatex / tectonic; typst or weasyprint as a plain-layout fallback). The manuscript is typeset in the ACM journals layout (`acmart` `acmsmall`, bundled in `assets/acmart/`, so nothing is downloaded per build); `--batch DIR` builds the PDF of every existing review that has none or an outdated one. Includes a drawn PRISMA 2020 flow diagram (`prisma_flow.py`), and fits every image to the page so none is cut off. Title and section numbering kept, wide tables wrapped, verified reference list swapped in (`--references`), charting / per-group / citation report appended (`--include`), a Unicode font chosen for TeX engines. Refuses while the citation report has errors or predates review.json. |
 | **Add the search strategy after the fact** | `update_provenance.py` | Databases, query strings, dates, filters, record counts, registration ID — patched in and re-exported, so a run is never blocked on paperwork. |
 | **Interrogate a finished review** | `query_sparql.py` (16 recipes), `query_postgres.py` (8) | Full-text vs abstract-only inclusions, retrieval routes, reading basis, screening decisions, exclusion reasons, research-question answers, EZproxy-sourced articles, full-text search over the store. |
 | **Run without an OpenRouter key** | `export_review.py` | The agent performs the stages itself and serialises through the same exporters — identical schema and exports, different author. |
@@ -55,6 +55,9 @@ text.
 ```
 synthscholar/
 ├── SKILL.md                     # skill entry point (all modes, interaction pattern)
+├── assets/
+│   ├── acm-review.latex         # pandoc template: the ACM journals layout (acmart acmsmall)
+│   └── acmart/                  # acmart.cls v2.03 + source (LPPL, unmodified), on the TeX path per build
 ├── references/
 │   ├── protocol_intake.md       # complete ReviewProtocol field catalog (intake)
 │   ├── byo_corpus_review.md     # user-supplied-PDF workflow, schemas, PRISMA flow rules
@@ -78,7 +81,7 @@ synthscholar/
     ├── verify_citations.py      # DOIs/PMIDs vs registries, retractions, in-text citations
     ├── assemble_manuscript.py   # review.json + review.manuscript.json → the paper (template gates)
     ├── review_figures.py        #   └─ the standard figures, drawn from the data (SVG)
-    ├── generate_review_pdf.py   # manuscript → .tex → PDF (page-limit guard)
+    ├── generate_review_pdf.py   # manuscript → .tex → PDF, ACM layout (page-limit guard; --batch)
     ├── prisma_flow.py           #   └─ PRISMA 2020 flow diagram (SVG / PDF) from the flow counts
     ├── query_sparql.py          # run recipes against a .ttl / .jsonld export
     ├── query_postgres.py        # run recipes against the article store DB
@@ -123,6 +126,7 @@ python scripts/verify_citations.py out/review.json --apply out/review.verified.j
 # PDF of the review, verified references swapped in, charting + citation report appended
 python scripts/assemble_manuscript.py out/review.json --check
 python scripts/generate_review_pdf.py out/review.manuscript.md
+python scripts/generate_review_pdf.py --batch ~/reviews/      # every review still missing a PDF
 
 # List available named queries
 python scripts/query_sparql.py --list
