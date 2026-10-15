@@ -225,10 +225,20 @@ python scripts/research_questions.py out/review.json --outdir out/ --themes them
   synthesis attributable.
 - **Try open access before asking for a library session.** `fetch_ezproxy.py`
   resolves DOIs through Unpaywall → OpenAlex → Semantic Scholar first, which
-  needs no setup; only what's left behind a paywall needs the user's own
-  EZproxy cookies. Don't ask for credentials until `--oa-only` has run and
-  something is still missing. Then keep within their licence: one paper at a
-  time, delayed, capped, and never raise the ceiling on their behalf.
+  needs no setup; only what's left behind a paywall needs the user's library
+  sign-in. **Never ask the user to set `EZPROXY_*` variables or export
+  cookies.** Run `fetch_ezproxy.py` and it signs them in itself: the first
+  time a paper isn't open access, a browser window opens at their library's
+  login. Tell them it's coming ("a browser window will open; sign in with
+  your library account"), and run the command with a long timeout (it waits
+  up to 5 minutes for them). The proxy is found from their email domain. If
+  the script exits 4, ask one question, "Which university or library do
+  you get journal access through?", and pass the answer as `--institution`.
+  If it still exits 4, ask for any link their library gives when they open
+  an article, and pass it as `--library-link`. Exit 3 means Playwright is
+  missing: ask before installing it (dependency table below). Keep within
+  their licence: one paper at a time, delayed, capped, and never raise the
+  ceiling on their behalf.
 - **Report the reading basis when you summarise.** "23 of 25 read in full text,
   2 included on abstract alone" is different evidence from "25 included".
 - **The research questions organise themselves — declare them in
@@ -375,6 +385,7 @@ step can't run and carry on with the rest.
 | Script | Needs | Check | Install (on confirm) |
 | --- | --- | --- | --- |
 | `verify_citations.py`, `fetch_ezproxy.py` | `httpx` | `python -c "import httpx"` | `pip install httpx` |
+| `fetch_ezproxy.py` library sign-in (paywalled papers only) | `playwright` + Chrome, Edge or Playwright's Chromium | `python -c "import playwright"` | `pip install playwright` (+ `playwright install chromium` only if neither Chrome nor Edge is installed) |
 | `query_sparql.py` | `rdflib` | `python -c "import rdflib"` | `pip install rdflib` |
 | `query_postgres.py`, `backfill_full_text.py` | `psycopg` | `python -c "import psycopg"` | `pip install "psycopg[binary]>=3.1"` |
 | `build_corpus.py` | `pymupdf`; `docling` optional | `python -c "import fitz"` | `pip install pymupdf` (+ `pip install docling` for scans/tables) |
@@ -480,7 +491,9 @@ scripts) to see every named recipe.
   paywalled paper with no repository copy misses on all three providers.
   Unpaywall additionally needs `SYNTHSCHOLAR_EMAIL` (their ToS) and is skipped
   without it.
-- Institutional access (EZproxy) needs a live browser-exported session cookie
-  and only reaches what the institution licenses. Credentials go in
-  `EZPROXY_*` env vars, never on a command line — the CLI invocation is stored
-  verbatim in provenance.
+- Institutional access (EZproxy) reaches only what the institution licenses.
+  The browser sign-in saves the proxy's session cookies under
+  `~/.config/synthscholar/` (owner-only permissions), never the password, and
+  `fetch_ezproxy.py --logout` deletes them. A session lasts hours, and the
+  browser reopens by itself when it expires. Never put a cookie on a command
+  line: the CLI invocation is stored verbatim in provenance.

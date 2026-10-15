@@ -132,35 +132,56 @@ tries two stages in the same order as the application's `FullTextResolver`:
 | Stage | Route | Needs | Recorded as |
 | --- | --- | --- | --- |
 | 1 | Unpaywall → OpenAlex → Semantic Scholar | nothing (an email for Unpaywall) | `unpaywall_pdf`, `openalex_pdf`, `semanticscholar_pdf` |
-| 2 | the user's own EZproxy session | `EZPROXY_HOST` + session cookie | `ezproxy_pdf` |
+| 2 | the user's own EZproxy session | a one-time browser sign-in (automatic) | `ezproxy_pdf` |
 
 **Open access goes first, and this matters.** A DOI with a free copy costs
 nothing, needs no library session, and doesn't consume one of the user's
 capped proxy requests. A corpus that is largely open access can be assembled
-with no institutional setup at all — so don't ask the user for cookies until
-stage 1 has actually left something unretrieved.
+with no institutional setup at all, and stage 2 only signs in when stage 1 has
+actually left something unretrieved.
 
 ```bash
 # Stage 1 alone — no institutional setup needed
 export SYNTHSCHOLAR_EMAIL=you@example.com    # Unpaywall's ToS requires a contact
 python scripts/fetch_ezproxy.py --corpus corpus.json --oa-only
 
-# Add stage 2 for whatever is left behind a paywall
-export EZPROXY_HOST=ezproxy.myuniversity.edu
-export EZPROXY_MODE=hostname-suffix          # or login-url — check your library's links
-export EZPROXY_COOKIE_FILE=~/ezproxy-cookies.txt
-export EZPROXY_DELAY=3                       # seconds between requests
-export EZPROXY_MAX_REQUESTS=100              # per-run ceiling
-
+# Both stages: a browser opens at the library login the first time a paper
+# isn't open access, then the saved session is reused
 python scripts/fetch_ezproxy.py --status
 python scripts/fetch_ezproxy.py --corpus corpus.json --pdf-dir ./pdfs
 python scripts/fetch_ezproxy.py --doi-file dois.txt --pdf-dir ./pdfs   # no corpus yet
+
+# Sign in ahead of time, name the institution, or forget the session
+python scripts/fetch_ezproxy.py --login
+python scripts/fetch_ezproxy.py --login --institution mit
+python scripts/fetch_ezproxy.py --login --library-link "https://www-nature-com.libproxy.mit.edu/…"
+python scripts/fetch_ezproxy.py --logout
 ```
+
+**How the proxy is found**, so the user is never asked for a hostname:
+`--proxy-host`, then `--library-link` (any off-campus article link; the host
+is read out of it), then `--institution`. After those, the saved login, then
+`EZPROXY_HOST`, then the domain of the user's email (`SYNTHSCHOLAR_EMAIL`,
+`NCBI_EMAIL` or `git config user.email`). A domain maps through a short
+built-in table (`mit.edu → libproxy.mit.edu`), and otherwise the usual
+EZproxy hostnames for it are probed (`ezproxy.<domain>`, `libproxy.<domain>`,
+`<name>.idm.oclc.org`, …). A candidate is accepted only if the server
+answers as EZproxy. Exit 4 means none matched: ask the user which university
+they get access through, then for a library link. The URL style
+(`hostname-suffix` or `login-url`) is read from where the login lands.
+
+**The saved session** lives in `~/.config/synthscholar/` (owner-only):
+`ezproxy.json` (host, mode, when), `ezproxy-cookies.txt` (the proxy's own
+cookies only, not the identity provider's), and `browser-profile/`, which
+keeps the institution's "remember this device" so MFA isn't asked every time.
+Before reuse, the session is checked against the proxy. An expired one
+reopens the browser once per run.
 
 | Setting | What it is |
 | --- | --- |
 | `SYNTHSCHOLAR_EMAIL` | polite-pool contact; **Unpaywall is skipped without it** (their ToS). OpenAlex and Semantic Scholar still work |
 | `SEMANTIC_SCHOLAR_API_KEY` | optional; lifts Semantic Scholar's 1 req/s public limit |
+| `EZPROXY_HOST` etc. | **not needed** — manual override of the browser sign-in; set all of host + cookie to use it |
 | `EZPROXY_HOST` | the gateway host from your library's off-campus links |
 | `EZPROXY_MODE` | `hostname-suffix` (`www-sciencedirect-com.ezproxy.uni.edu/…`) or `login-url` (`ezproxy.uni.edu/login?url=…`) |
 | `EZPROXY_COOKIE_FILE` | Netscape `cookies.txt` exported from a browser already signed in to the proxy |
@@ -172,10 +193,11 @@ Flags: `--oa-only` never touches the proxy; `--no-oa` skips open access entirely
 
 Notes that matter:
 
-- **Log in with a browser, not here.** Institutional SSO with MFA can't be
-  scripted responsibly. Export the session cookies instead; they expire, and a
-  login-page bounce is detected and reported rather than silently treated as a
-  paywall.
+- **The user signs in; the script never sees a password.** Institutional SSO
+  with MFA can't be scripted responsibly, so a real browser window is opened
+  and the user completes it themselves. Only the proxy's resulting session
+  cookies are kept. They expire; an expired session is detected before use
+  and the browser reopens, rather than the failure looking like a paywall.
 - **An open-access miss is not a failure.** Most DOIs have no free copy; that's
   normal and says nothing about the next one. Only *proxied* failures trip the
   stop-after-3 circuit breaker, because those really do indicate a dead session.
@@ -569,8 +591,9 @@ full-text-vs-abstract-only queries, since every PDF-backed article carries a
   the full read.
 - **Deduplication is the user's.** Nothing here detects that two PDFs are the
   same paper; `run_local_review.py` only rejects duplicate `pmid`s.
-- **Institutional access needs a live session.** EZproxy cookies expire, and no
-  amount of retrying fixes that — re-export them. Papers outside the
+- **Institutional access needs a live session.** EZproxy sessions expire, and no
+  amount of retrying fixes that: the script reopens the browser, or run
+  `fetch_ezproxy.py --login`. Papers outside the
   institution's licence simply won't resolve, and those entries stay
   abstract-only (reported as such, not hidden).
 - **Open-access coverage is uneven.** Unpaywall/OpenAlex/Semantic Scholar find

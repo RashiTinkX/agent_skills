@@ -28,6 +28,7 @@ dependencies:
     - "docling"              # first extraction backend in build_corpus.py (tables + OCR)
     - "psycopg[binary]>=3.1" # article-store queries (query_postgres.py, backfill)
     - "pydantic>=2.0"        # result validation (export_review.py)
+    - "playwright"           # library sign-in in a browser (fetch_ezproxy.py, paywalled papers only)
 
   # Not pip packages: command-line tools generate_review_pdf.py shells out to.
   # Check with `python scripts/generate_review_pdf.py --check-deps`.
@@ -49,7 +50,8 @@ dependencies:
   scripts:
     validate_protocol.py: "stdlib only (PyYAML optional, for .yaml protocols)"
     build_corpus.py: "docling first (tables + OCR, the only backend that reads a scanned PDF), then pymupdf, pypdf, the pdftotext CLI; --no-docling skips it"
-    fetch_ezproxy.py: "httpx; open access needs no credentials, institutional access needs the EZPROXY_* vars"
+    fetch_ezproxy.py: "httpx; open access needs no credentials; institutional access signs in through a browser (playwright) — no EZPROXY_* setup"
+    ezproxy_login.py: "playwright + Chrome/Edge (or playwright's Chromium); saves the session under ~/.config/synthscholar"
     oa_client.py: "httpx; vendored Unpaywall/OpenAlex/Semantic Scholar DOI chain, imported by fetch_ezproxy.py"
     ezproxy_client.py: "httpx; vendored EZproxy client, used when synthscholar.ezproxy is absent"
     run_local_review.py: "synthscholar development checkout + OPENROUTER_API_KEY"
@@ -66,7 +68,7 @@ dependencies:
     SYNTHSCHOLAR_EMAIL: "polite-pool contact; Unpaywall requires it (ToS) and is skipped without it"
     NCBI_API_KEY: "optional; raises the PubMed E-utilities rate limit for verify_citations.py"
     SEMANTIC_SCHOLAR_API_KEY: "optional; lifts Semantic Scholar's 1 req/s public rate limit"
-    EZPROXY_HOST: "institutional proxy host, for retrieving paywalled papers"
+    EZPROXY_HOST: "optional manual override — the browser sign-in finds and saves the proxy itself"
     EZPROXY_COOKIE_FILE: "browser-exported cookies.txt for that proxy (or EZPROXY_COOKIE)"
     EZPROXY_MODE: "hostname-suffix (default) or login-url"
     EZPROXY_DELAY: "seconds between proxied requests (default 3)"

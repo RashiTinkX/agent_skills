@@ -93,9 +93,8 @@ export SYNTHSCHOLAR_EMAIL=you@example.com                     # Unpaywall's ToS 
 python scripts/fetch_ezproxy.py --status
 python scripts/fetch_ezproxy.py --corpus corpus.json --oa-only
 
-# … then your own institutional access for whatever is still paywalled
-export EZPROXY_HOST=ezproxy.myuniversity.edu
-export EZPROXY_COOKIE_FILE=~/ezproxy-cookies.txt              # exported from a logged-in browser
+# … then your own institutional access for whatever is still paywalled:
+# a browser window opens at your library's login the first time it's needed
 python scripts/fetch_ezproxy.py --corpus corpus.json --pdf-dir ./pdfs
 
 python scripts/run_local_review.py --print-provenance-template > search_provenance.json
@@ -172,11 +171,12 @@ is by feature, not version string (the package's `__version__` and its
   `SYNTHSCHOLAR_EMAIL` only to include Unpaywall (their ToS), optionally
   `SEMANTIC_SCHOLAR_API_KEY` to lift a rate limit. Run `--oa-only` first; a
   mostly-OA corpus needs nothing else.
-- Institutional access, for what open access can't reach: `EZPROXY_HOST` plus a
-  session cookie (`EZPROXY_COOKIE_FILE` or `EZPROXY_COOKIE`) exported from a
-  browser already signed in to your library's proxy. Credentials are read from
-  the environment only — never a CLI flag, since the command line is stored
-  verbatim in provenance. Requests are serialised, delayed (`EZPROXY_DELAY`) and
+- Institutional access, for what open access can't reach: nothing to set up.
+  The first paywalled paper opens a browser window at your library's login
+  (the proxy is found from your email domain, or `--institution mit`); sign
+  in once and the session is saved and reused until it expires. Needs
+  `playwright`. Setting `EZPROXY_HOST` / `EZPROXY_COOKIE_FILE` by hand still
+  works and takes precedence. Requests are serialised, delayed (`EZPROXY_DELAY`) and
   capped (`EZPROXY_MAX_REQUESTS`); using this within your library's terms is
   your responsibility. Open-access hits never consume that budget.
 
