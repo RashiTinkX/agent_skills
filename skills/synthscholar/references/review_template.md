@@ -210,6 +210,13 @@ Each subsection has this fixed shape, in protocol order:
 - the NR count;
 - at least 250 words.
 
+**Pre-filled when not yet written.** If `ms.results.rq.<id>` is empty, the
+subsection is filled from the charted answers in `review.json`. It gets a
+factual opening line ("Answers were charted for k of n included studies; m
+did not report it"), then one row per study with its answer, and every
+answer goes to `review.rq-<id>.csv`. Nothing is summarised or inferred. The
+gate `rq-unsynthesised` stays until the synthesis itself is written.
+
 **[effect]** When the review has no research questions, there is one
 subsection per synthesis theme. Each covers findings across studies (never
 study by study), the supporting studies, contradictory evidence, and the

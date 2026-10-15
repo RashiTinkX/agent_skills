@@ -528,10 +528,20 @@ class Manuscript:
             for q in rqs:
                 qid = _s(q.get("question_id"))
                 self.h(2, f"{qid} — {q.get('short_title') or q.get('theme') or q.get('question')}")
-                n = self.para(authored.get(qid), f"rq:{qid}", f"no synthesis was written for {qid}")
-                self.place(f"results.rq:{qid}")
-                if n < 250:
-                    self.gate("warning", "rq-short", f"{qid} synthesis is {n} words (< 250)")
+                if _s(authored.get(qid)).strip():
+                    n = self.para(authored.get(qid), f"rq:{qid}")
+                    self.place(f"results.rq:{qid}")
+                    if n < 250:
+                        self.gate("warning", "rq-short", f"{qid} synthesis is {n} words (< 250)")
+                elif self.charted_answers(q):
+                    self.place(f"results.rq:{qid}")
+                    self.gate("warning", "rq-unsynthesised",
+                              f"{qid} shows its charted answers only: write the synthesis (pattern, "
+                              f"denominators, exemplars, NR count) in results.rq.{qid}")
+                else:
+                    self.para("", f"rq:{qid}", f"no study's answer to {qid} was charted")
+                    self.place(f"results.rq:{qid}")
+                    self.gate("warning", "rq-short", f"{qid} has no synthesis and no charted answers")
         elif themes:
             for name, text in themes.items():
                 self.h(2, f"Theme: {name}")
@@ -567,6 +577,46 @@ class Manuscript:
             if sid and pm:
                 out[sid] = pm
         return out
+
+    NR = re.compile(r"^\s*(nr|n/?a|not reported|not stated|not specified|none reported|unclear|unknown)\b", re.I)
+
+    def charted_answers(self, q: dict) -> bool:
+        """Render one question's charted answers: a factual lead and one row per study.
+
+        Used when no synthesis has been written for the question. The answers are
+        the per-study ``custom_fields`` the charting stage filled, keyed by the
+        question's id (or its text). Nothing is summarised or inferred: the lead
+        only counts, and every answer is shown as charted. Returns False when no
+        study answered.
+        """
+        qid, text = _s(q.get("question_id")), _s(q.get("question")).strip().lower()
+        arts = {_s(a.get("pmid")): a for a in self.r.get("included_articles") or []}
+        to_article = self._source_to_article()
+        rows = []
+        for rb in self.r.get("data_charting_rubrics") or []:
+            custom = rb.get("custom_fields") or {}
+            ans = next((_s(v).strip() for k, v in custom.items()
+                        if _s(k) == qid or _s(k).strip().lower() == text), "")
+            if not ans:
+                continue
+            art = arts.get(to_article.get(_s(rb.get("source_id")), ""), {})
+            first = (_s(art.get("authors") or rb.get("authors")).split(",")[0].split(";")[0].strip()
+                     or _s(rb.get("title"))[:40] or _s(rb.get("source_id")))
+            rows.append([first, _s(art.get("year") or rb.get("year")) or "n.d.", ans])
+        if not rows:
+            return False
+        n_total = len(self.r.get("included_articles") or []) or len(rows)
+        nr = sum(1 for r in rows if self.NR.match(r[2]))
+        self.para(f"{qid} asked: “{_s(q.get('question')).strip()}” Answers were charted for "
+                  f"{len(rows)} of {n_total} included studies; {nr} of those did not report it. "
+                  "The table gives each study's charted answer.", f"rq:{qid}")
+        rows.sort(key=lambda r: (bool(self.NR.match(r[2])), r[1], r[0]))
+        header = ["Study", "Year", f"Charted answer ({qid})"]
+        self.table(header, rows[:INLINE_ROW_CAP])
+        safe = re.sub(r"[^\w.-]+", "-", qid) or "question"
+        self.lines += [self.sibling(f"{self.stem}.rq-{safe}.csv", len(rows),
+                                    lambda path: _write_csv(path, header, rows)), ""]
+        return True
 
     def _concern_by_study(self) -> dict[str, str]:
         """Worst domain concern per article pmid (appraisals are keyed by source_id)."""
