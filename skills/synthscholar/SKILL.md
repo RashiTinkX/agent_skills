@@ -313,9 +313,14 @@ Hard rules:
   resolves DOIs through Unpaywall → OpenAlex → Semantic Scholar first, which
   needs no setup; only what's left behind a paywall needs the user's library
   sign-in. **Never ask the user to set `EZPROXY_*` variables or export
-  cookies.** Run `fetch_ezproxy.py` and it signs them in itself: the first
-  time a paper isn't open access, a browser window opens at their library's
-  login. Tell them it's coming ("a browser window will open; sign in with
+  cookies.** Run `fetch_ezproxy.py` and it signs them in itself, **at the
+  start of the run**. The saved session is checked first; if there is none,
+  or it has expired, a browser window opens at their library's login before
+  any fetching. So a long run never stalls halfway, waiting on a window
+  nobody saw. A live session passes without a browser. For a long session
+  (fetching, then the review), sign in once up front with
+  `fetch_ezproxy.py --login`. `--lazy-login` restores on-demand sign-in.
+  Tell them it's coming ("a browser window will open; sign in with
   your library account"), and run the command with a long timeout (it waits
   up to 5 minutes for them). The proxy is found from their email domain. If
   the script exits 4, ask one question, "Which university or library do

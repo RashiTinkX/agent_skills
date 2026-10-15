@@ -145,8 +145,8 @@ actually left something unretrieved.
 export SYNTHSCHOLAR_EMAIL=you@example.com    # Unpaywall's ToS requires a contact
 python scripts/fetch_ezproxy.py --corpus corpus.json --oa-only
 
-# Both stages: a browser opens at the library login the first time a paper
-# isn't open access, then the saved session is reused
+# Both stages: the library session is checked at the start (a browser opens
+# only if it is missing or expired), then reused for the whole run
 python scripts/fetch_ezproxy.py --status
 python scripts/fetch_ezproxy.py --corpus corpus.json --pdf-dir ./pdfs
 python scripts/fetch_ezproxy.py --doi-file dois.txt --pdf-dir ./pdfs   # no corpus yet

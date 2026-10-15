@@ -17,8 +17,9 @@ Two stages, in the same order the application's ``FullTextResolver`` uses:
 Open access going first is what makes a mostly-OA corpus work with no library
 setup at all, and keeps the proxy budget for the papers that actually need it.
 
-Stage 2 signs in by itself. The first time a paper isn't open access, a
-browser window opens at the user's library login (SSO, MFA — whatever their
+Stage 2 signs in by itself, **at the start of the run**: the saved library
+session is checked first, and if there is none or it has expired a browser
+window opens at the user's library login (SSO, MFA — whatever their
 institution uses); once they are through, the session is saved under
 ``~/.config/synthscholar/`` and reused until it expires. The proxy is worked
 out from their email domain, or from ``--institution`` / ``--library-link``
@@ -118,12 +119,12 @@ def proxy_config(EZProxyConfig):
 
 
 class AutoLoginFetcher:
-    """An ``EZProxyFetcher`` that signs the user in the first time it is needed.
+    """An ``EZProxyFetcher`` that signs the user in when access is first checked.
 
-    ``fetch_one`` asks ``available`` only after open access has missed, so a
-    run whose papers are all open access never opens a browser. On that first
-    ask the saved session is checked against the proxy; if there is none, or it
-    has expired, a browser window opens for the user to sign in (once per run).
+    ``main`` checks at the start of a run (``--lazy-login`` defers it to the first
+    paper open access misses). The saved session is validated against the proxy;
+    if there is none, or it has expired, a browser window opens for the user to
+    sign in, once per run.
     """
 
     def __init__(self, EZProxyConfig, EZProxyFetcher, *, login_kwargs: dict,
@@ -529,6 +530,8 @@ def main() -> int:
                       help="the EZproxy host itself, if you know it")
     sign.add_argument("--no-login", action="store_true",
                       help="never open a browser; skip paywalled papers instead")
+    sign.add_argument("--lazy-login", action="store_true",
+                      help="sign in only when the first paywalled paper needs it, not at the start")
     args = ap.parse_args()
     login_kwargs = {"proxy_host": args.proxy_host, "library_link": args.library_link,
                     "institution": args.institution}
@@ -591,6 +594,12 @@ def main() -> int:
     pdf_dir = Path(args.pdf_dir)
     pdf_dir.mkdir(parents=True, exist_ok=True)
     if not args.dry_run:
+        if fetcher is not None and not args.no_login and not args.lazy_login:
+            # Sign in before the run, not in the middle of it: a long fetch
+            # should not stop at paper 40 waiting for someone to notice a
+            # browser window. A still-valid saved session passes silently.
+            print("Checking library access before starting…")
+            fetcher.available
         print(_status_lines())
         if args.no_login and fetcher is not None and not fetcher._inner.config.enabled:
             print("NOTE  --no-login: paywalled papers will be missed")
