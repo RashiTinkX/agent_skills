@@ -481,21 +481,26 @@ change: [citation_verification.md](citation_verification.md).
 
 ```bash
 python scripts/generate_review_pdf.py --check-deps
-python scripts/verify_citations.py out/review.json --style vancouver
+python scripts/verify_citations.py out/review.json --style vancouver   # after the last export
 python scripts/generate_review_pdf.py out/review.md --references vancouver \
-    --include charting appraisal per-group citations -o out/review.pdf
+    --include charting per-group citations -o out/review.pdf
 ```
 
 The script renders `review.md` through pandoc without changing its content:
 - the `# title` becomes the PDF title, and the review's own section numbers are
   kept (`--number-sections` would double them);
 - `--references <style>` swaps in the verified list from `verify_citations.py --style`;
-- `--include` appends sidecar exports as appendices, each on a new page.
+- `--include` appends sidecar exports as appendices, each on a new page. One
+  whose title already heads a section of `review.md` is skipped: `appraisal`
+  repeats the review's own *Appendix C*.
 
 Cell line breaks (`<br>`), `---` separators and the `✓ ✗ ⚠` symbols are
-rewritten for each engine, so tables keep their rows and the symbols print.
-The build stops while `review.citations.json` has errors, and warns when there
-is no report or it is older than `review.md`. Engines, in the order tried:
+rewritten for each engine, so tables keep their rows and the symbols print. On
+TeX engines a font covering the review's characters (`≥ μ κ →` …) is chosen
+with `fc-list` (`--mainfont` overrides), and any glyph still missing is
+reported. The build stops while `review.citations.json` has errors or is older
+than `review.md` (re-verify after the last re-export; `--citations` points at a
+report elsewhere), and warns when there is none. Engines, in the order tried:
 xelatex, lualatex, tectonic, pdflatex, typst, weasyprint, wkhtmltopdf, prince.
 `--pdf-engine` forces one, `--keep-source` writes the Markdown pandoc actually
 read, and `--dry-run` prints the command without running it.

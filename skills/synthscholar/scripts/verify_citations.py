@@ -144,6 +144,9 @@ STRUCTURED_ID_KEYS = {"paper_pmid", "pmid"}  # plus any key ending in "_pmids"
 QUOTED = {"evidence_spans"}
 
 SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2}
+# Reference-list styles render_reference() knows. generate_review_pdf.py takes
+# whatever <stem>.references.<style>.md this wrote, so this is the one list.
+STYLES = ("apa", "nature", "vancouver", "ieee")
 
 
 # ─────────────────────────── normalisation ────────────────────────────
@@ -1153,7 +1156,7 @@ def main() -> int:
     ap.add_argument("--no-search", action="store_true",
                     help="don't search Crossref for DOI candidates of DOI-less references")
     ap.add_argument("--check-urls", action="store_true", help="also test non-DOI URLs")
-    ap.add_argument("--style", choices=["apa", "nature", "vancouver", "ieee"],
+    ap.add_argument("--style", choices=STYLES,
                     help="also write a reference list in this style from verified metadata")
     ap.add_argument("--apply", metavar="OUT_JSON",
                     help="write a copy of the review with registry-confirmed fixes")

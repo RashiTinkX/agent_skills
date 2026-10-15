@@ -164,14 +164,18 @@ python scripts/run_local_review.py --protocol protocol.json --corpus corpus.json
 python scripts/update_provenance.py out/review.json \
     --provenance search_provenance.json --outdir out/
 
-# 6. Citations — gate before handing the review over (exit 1 on errors)
+# 6. Citations — gate before handing the review over (exit 1 on errors).
+#    --apply writes registry-confirmed fixes to a copy; re-export it over the
+#    review, then verify again so the report describes what will ship.
 python scripts/verify_citations.py out/review.json
 python scripts/verify_citations.py out/review.json --apply out/review.verified.json
-
-# 7. PDF (optional) — refuses while the citation report has errors
+python scripts/export_review.py out/review.verified.json --outdir out/ --formats md ttl json
 python scripts/verify_citations.py out/review.json --style vancouver
+
+# 7. PDF (optional) — refuses while out/review.citations.json has errors or
+#    is older than out/review.md
 python scripts/generate_review_pdf.py out/review.md --references vancouver \
-    --include charting appraisal citations
+    --include charting per-group citations
 ```
 
 Step 4 needs `OPENROUTER_API_KEY` and the `synthscholar` package — it drives
@@ -390,7 +394,7 @@ python scripts/research_questions.py out/review.json --outdir out/   # retrofit 
 python scripts/update_provenance.py out/review.json --provenance search_provenance.json
 python scripts/verify_citations.py out/review.json                     # citation gate
 python scripts/verify_citations.py out/review.json --style apa --apply out/review.verified.json
-python scripts/generate_review_pdf.py out/review.md --references apa --include charting appraisal
+python scripts/generate_review_pdf.py out/review.md --references apa --include charting citations
 python scripts/generate_review_pdf.py --check-deps                     # pandoc + engine?
 
 # SPARQL over an RDF export — named recipe or your own query
