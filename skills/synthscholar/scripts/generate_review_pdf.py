@@ -783,8 +783,15 @@ def _build(md: Path, output_pdf: Optional[str], tmp: Path, *, engine: str, famil
            template: Optional[str], toc: bool, number_sections: bool, bibliography: Optional[str],
            mainfont: Optional[str], dry_run: bool, keep_source: bool, timeout: int,
            flow_diagram: bool, flow_json: Optional[Path]) -> bool:
-    flow_image, flow_note = (flow_figure(md, flow_json, family, tmp) if flow_diagram
-                             else (None, ""))
+    # #3: a kept .tex must still compile after the temp dir is gone, so images
+    # converted for it live in <name>_files/ beside it, not in the temp dir.
+    out_path = Path(output_pdf) if output_pdf else md.with_suffix(".pdf")
+    assets = out_path.with_name(f"{out_path.stem}_files") if (family in LATEX_ENGINES and keep_tex) else tmp
+    assets.mkdir(parents=True, exist_ok=True)
+    assets = assets.resolve()      # the engine compiles from the temp dir: paths must be absolute
+    has_flow = bool(re.search(r"!\[[^\]]*\]\([^)]*(prisma|flow)[^)]*\)", md.read_text(encoding="utf-8"), re.I))
+    flow_image, flow_note = (flow_figure(md, flow_json, family, assets)
+                             if flow_diagram and not has_flow else (None, ""))
     try:
         text, title, notes = assemble(md, family, references, include or [], flow_image)
     except ValueError as e:
@@ -793,7 +800,7 @@ def _build(md: Path, output_pdf: Optional[str], tmp: Path, *, engine: str, famil
     if flow_note:
         (print(f"  {flow_note}", file=sys.stderr) if flow_note.startswith("WARNING")
          else notes.insert(0, flow_note))
-    text, img_notes = prepare_images(text, [md.parent], family, tmp)
+    text, img_notes = prepare_images(text, [md.parent], family, assets)
     for n in img_notes:
         print(f"  {n}", file=sys.stderr)
     text = for_engine(text, family)
@@ -925,7 +932,7 @@ def latex_route(cmd: list[str], out: Path, engine: str, family: str, tmp: Path,
     if r.returncode != 0:
         return r
     if keep_tex:
-        shutil.copy(tex, out.with_suffix(".tex"))
+        shutil.copy(tex, out.with_suffix(".tex"))   # its images are in <name>_files/ beside it
     if family == "tectonic":
         runs = [[engine, "--keep-logs", "--outdir", str(tmp), str(tex)]]
     else:

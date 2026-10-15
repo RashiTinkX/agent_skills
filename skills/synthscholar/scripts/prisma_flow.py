@@ -83,7 +83,8 @@ def flow_lines(flow: dict) -> dict[str, list[str]]:
         sources.append(f"Citation searching (n = {_n(flow['db_hops'])})")
     if not sources:
         sources = [f"Databases and registers (n = {_n(flow.get('total_identified'))})"]
-    reasons = flow.get("excluded_reasons") or {}
+    # eligibility-stage reasons: the per-stage field when recorded, else the combined one
+    reasons = flow.get("excluded_reasons_full_text") or flow.get("excluded_reasons") or {}
     excluded = ([f"{r} (n = {_n(c)})" for r, c in sorted(reasons.items(), key=lambda kv: -int(kv[1] or 0))]
                 or [f"(n = {_n(flow.get('excluded_eligibility'))})"])
     return {

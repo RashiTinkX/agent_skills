@@ -13,7 +13,7 @@ for it to show something, never for decoration:
 | ``designs`` | study design distribution | ≥ 2 known designs | results.overview |
 | ``groups`` | studies per group (the protocol's grouping dimension) | ≥ 2 groups | results.groups |
 | ``appraisal`` | appraisal concern per domain (Low / Some / High) | ≥ 3 studies appraised | results.appraisal |
-| ``retrieval`` | how the reports read were obtained | ≥ 2 routes, or any abstract-only | results.flow |
+| ``retrieval`` | full-text retrieval of the reports sought, by route | ≥ 2 routes, or any not retrieved | results.flow |
 
 Each figure also gets a manifest entry (``figures.json``): file, caption, the
 template section it belongs in, and the numbers it shows (``facts``), so its
@@ -199,7 +199,7 @@ def build(review: dict, outdir: Path, only: set[str] | None = None) -> list[dict
         return not only or fid in only
 
     def emit(fid: str, svg: str, caption: str, section: str, facts: dict) -> None:
-        path = outdir / f"fig_{fid}.svg"
+        path = (outdir / f"fig_{fid}.svg").resolve()   # absolute: valid from any working directory
         path.write_text(svg, encoding="utf-8")
         figures.append({"id": fid, "file": str(path), "caption": caption, "section": section,
                         "facts": facts})
@@ -267,16 +267,18 @@ def build(review: dict, outdir: Path, only: set[str] | None = None) -> list[dict
              "results.appraisal", {"n_appraised": len(appraisals),
                                    "per_domain": {d: dict(per_domain[d]) for d in doms}})
 
+    # Same population as the Methods retrieval table: the reports sought, by the
+    # route that retrieved each, plus those not retrieved.
     routes = dict(flow.get("full_text_sources") or {})
-    abstract_only = int(flow.get("assessed_on_abstract_only") or 0)
-    if want("retrieval") and (len(routes) >= 2 or (routes and abstract_only)):
+    not_retrieved = int(flow.get("not_retrieved") or 0)
+    if want("retrieval") and (len(routes) >= 2 or (routes and not_retrieved)):
         items = sorted(routes.items(), key=lambda kv: -kv[1])
-        labels = [ROUTE_LABELS.get(k, k) for k, _ in items] + (["Abstract only (no full text)"] if abstract_only else [])
-        values = [v for _, v in items] + ([abstract_only] if abstract_only else [])
-        emit("retrieval", horizontal_bars(labels, values, "Reading basis", "Reports"),
-             "How the assessed reports were read: full-text retrieval route, or abstract only.",
+        labels = [ROUTE_LABELS.get(k, k) for k, _ in items] + (["Not retrieved"] if not_retrieved else [])
+        values = [v for _, v in items] + ([not_retrieved] if not_retrieved else [])
+        emit("retrieval", horizontal_bars(labels, values, "Full-text retrieval", "Reports"),
+             f"Full-text retrieval of the {sum(values)} reports sought, by route.",
              "results.flow", {"routes": dict(zip(labels, values)),
-                                   "full_text": sum(routes.values()), "abstract_only": abstract_only})
+                              "retrieved": sum(routes.values()), "not_retrieved": not_retrieved})
     return figures
 
 

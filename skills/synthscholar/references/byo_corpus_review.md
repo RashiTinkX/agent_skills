@@ -566,7 +566,8 @@ beside it, if there is one, and warns otherwise.
 
 **LaTeX route.** On a TeX engine (xelatex, lualatex, tectonic, pdflatex):
 - pandoc writes a standalone `.tex`, kept next to the PDF so every page's
-  source can be inspected or edited;
+  source can be inspected or edited. Its converted images go in
+  `<name>_files/` beside it, so the kept `.tex` recompiles on its own;
 - the engine compiles it, running twice for xelatex, lualatex and pdflatex;
 - SVG figures are converted to PDF first, and image paths are made
   absolute;

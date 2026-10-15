@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -110,12 +111,12 @@ class Manuscript:
         for fid, extra in (ms.get("figures") or {}).items():
             self.figs.setdefault(fid, {"id": fid}).update(extra or {})
         self.figs = {k: v for k, v in self.figs.items() if v.get("file")}
-        order = sorted(self.figs.values(), key=lambda f: (
-            SLOT_ORDER.index(f.get("section", "").split(":")[0]) if f.get("section", "").split(":")[0] in SLOT_ORDER else 99,
-            f.get("section", "")))
-        self.fig_no = {f["id"]: i for i, f in enumerate(order, 1)}
-        self.placed: set[str] = set()
+        # Numbers follow placement order, found by a first pass (build() runs
+        # twice): an unplaced figure takes no number, and RQ10 never precedes RQ2.
+        self.fig_no: dict[str, int] = {f: i for i, f in enumerate(self.figs, 1)}
+        self.placed: list[str] = []
         self.referenced: set[str] = set()
+        self.emitted: list[tuple[int, ...]] = []
 
     # ── primitives ──
 
@@ -138,10 +139,12 @@ class Manuscript:
             self.num = [self.num[0] + 1, 0]
             label = f"{self.num[0]}. {title}"
             self.lines += ["", f"## {label}", ""]
+            self.emitted.append((self.num[0],))
         elif level == 2:
             self.num[1] += 1
             label = f"{self.num[0]}.{self.num[1]} {title}"
             self.lines += ["", f"### {label}", ""]
+            self.emitted.append((self.num[0], self.num[1]))
         else:
             label = title
             self.lines += ["", f"## {title}", ""]
@@ -152,7 +155,8 @@ class Manuscript:
         text = _s(text).strip()
         if not text:
             text = NOT_ASSESSED.format(reason or "no content was written for this section")
-        text = self.resolve(text)
+        # authored text sits inside a numbered section: its own headings go below it
+        text = re.sub(r"^(#{1,3})(\s)", lambda m: "####" + m.group(2), self.resolve(text), flags=re.M)
         self.lines += [text, ""]
         n = _words(text)
         if key:
@@ -166,16 +170,27 @@ class Manuscript:
         else:
             self.table_rows += len(rows)
 
+    def _figure_path(self, file: str) -> str:
+        """The figure's path relative to the manuscript, whatever base it was recorded against."""
+        p = Path(file)
+        if not p.is_absolute():
+            for base in (self.outdir, Path.cwd()):
+                if (base / p).is_file():
+                    p = base / p
+                    break
+            else:
+                return p.as_posix()
+        return Path(os.path.relpath(p.resolve(), self.outdir.resolve())).as_posix()
+
     def place(self, slot: str) -> None:
-        for f in sorted(self.figs.values(), key=lambda f: self.fig_no[f["id"]]):
+        for f in self.figs.values():
             if f.get("section") == slot and f["id"] not in self.placed:
-                self.placed.add(f["id"])
-                rel = Path(f["file"])
-                rel = rel.relative_to(self.outdir) if rel.is_absolute() and self.outdir in rel.parents else rel
+                self.placed.append(f["id"])
+                rel = self._figure_path(f["file"])
                 interp = _s(f.get("interpretation")).strip()
                 if interp:
                     self.para(interp if FIG_REF.search(interp) else f"{{fig:{f['id']}}}: {interp}")
-                self.lines += [f"![]({rel.as_posix()}){{width=100%}}", "",
+                self.lines += [f"![]({rel}){{width=100%}}", "",
                                f"**Figure {self.fig_no[f['id']]}.** {_s(f.get('caption')).strip()}", ""]
 
     def sibling(self, name: str, rows: int, write: Optional[Callable[[Path], None]] = None) -> str:
@@ -188,6 +203,17 @@ class Manuscript:
     # ── document ──
 
     def build(self) -> str:
+        """Render twice: the first pass fixes figure order, the second numbers by it."""
+        self._render()
+        order = list(self.placed)
+        for attr, val in (("lines", []), ("gates", []), ("section_words", {}), ("siblings", []),
+                          ("table_rows", 0), ("appendix_words", 0), ("appendix_rows", 0), ("n_refs", 0),
+                          ("num", [0, 0]), ("placed", []), ("referenced", set()), ("emitted", [])):
+            setattr(self, attr, val)
+        self.fig_no = {fid: i for i, fid in enumerate(order, 1)}
+        return self._render()
+
+    def _render(self) -> str:
         self.front_matter()
         self.abstract()
         self.introduction()
@@ -529,13 +555,29 @@ class Manuscript:
             body = re.sub(r"^(#{1,3})(\s)", lambda m: "####" + m.group(2), _s(self.r["synthesis_text"]), flags=re.M)
             self.para(body, "results")
 
+    def _source_to_article(self) -> dict[str, str]:
+        """Charting/appraisal ``source_id`` (S-001) → article pmid, via the rubric's DOI or title."""
+        by_doi = {_s(a.get("doi")).lower(): _s(a.get("pmid")) for a in self.r.get("included_articles") or [] if a.get("doi")}
+        by_title = {re.sub(r"\W+", " ", _s(a.get("title")).lower()).strip(): _s(a.get("pmid"))
+                    for a in self.r.get("included_articles") or []}
+        out = {}
+        for rb in self.r.get("data_charting_rubrics") or []:
+            sid = _s(rb.get("source_id"))
+            pm = by_doi.get(_s(rb.get("doi")).lower()) or by_title.get(re.sub(r"\W+", " ", _s(rb.get("title")).lower()).strip())
+            if sid and pm:
+                out[sid] = pm
+        return out
+
     def _concern_by_study(self) -> dict[str, str]:
+        """Worst domain concern per article pmid (appraisals are keyed by source_id)."""
         order = {"Low": 0, "Some": 1, "High": 2}
+        to_article = self._source_to_article()
         out = {}
         for ap in self._appraisals():
             levels = [d.get("domain_concern") for d in ap.get("domains") or [] if d.get("domain_concern") in order]
             if levels:
-                out[_s(ap.get("source_id"))] = max(levels, key=lambda x: order[x])
+                sid = _s(ap.get("source_id"))
+                out[to_article.get(sid, sid)] = max(levels, key=lambda x: order[x])
         return out
 
     def _appraisals(self) -> list[dict]:
@@ -569,11 +611,13 @@ class Manuscript:
                  ("Limitations", d.get("limitations") or self.r.get("limitations") or pd.get("limitations")),
                  ("Reflexivity on automated authorship", d.get("reflexivity"))]
         self.place("discussion")
+        core = {"Principal findings", "Interpretation", "Comparison with prior reviews",
+                "Implications", "Research agenda"}
         written = 0
         for title, text in parts:
             self.h(2, title)
-            n = self.para(text, "discussion", f"no {title.lower()} were written" if title.endswith("s") else f"no {title.lower()} was written")
-            if text and title != "Limitations":
+            self.para(text, "discussion", f"no {title.lower()} were written" if title.endswith("s") else f"no {title.lower()} was written")
+            if _s(text).strip() and title in core:
                 written += 1
         if not written:
             self.gate("fail", "discussion-only-limitations",
@@ -621,7 +665,9 @@ class Manuscript:
             if body and body[0].startswith("## "):
                 body = body[1:]
             self.lines += body + [""]
-            self.n_refs = sum(1 for ln in body if re.match(r"^(\d+\.|\[\d+\])\s|\S", ln) and ln.strip())
+            numbered = sum(1 for ln in body if re.match(r"^\s*(\d+\.|\[\d+\])\s", ln))
+            blocks = len([b for b in re.split(r"\n\s*\n", "\n".join(body)) if b.strip()])
+            self.n_refs = numbered or blocks      # wrapped lines are not extra references
             return
         for k, a in enumerate(self.r.get("included_articles") or [], 1):
             doi = f" https://doi.org/{a['doi']}" if a.get("doi") else ""
@@ -727,11 +773,9 @@ class Manuscript:
                 + (self.table_rows + self.appendix_rows) / ROWS_PER_PAGE + REF_PAGES * self.n_refs)
 
     def check_gates(self) -> None:
-        # 1. numbering continuity (by construction, verified)
-        nums = [tuple(int(x) for x in m.group(1).split(".") if x)
-                for m in (re.match(r"^#{2,3}\s+(\d+(?:\.\d+)?)[.\s]", ln) for ln in self.lines) if m]
+        # 1. numbering continuity of the headings this assembler emitted
         prev = (0, 0)
-        for n in nums:
+        for n in self.emitted:
             ok = (n == (prev[0] + 1,)) or (len(n) == 2 and n[0] == prev[0] and n[1] == (prev[1] if len(prev) > 1 else 0) + 1)
             if not ok:
                 self.gate("fail", "numbering", f"heading numbering jumps at {'.'.join(map(str, n))}")
@@ -756,7 +800,7 @@ class Manuscript:
                 self.gate("warning", "figure-uninterpreted",
                           f"Figure {self.fig_no[fid]} ({fid}) is placed but never discussed: refer to it as "
                           f"{{fig:{fid}}} in its section, or give figures.{fid}.interpretation")
-        for fid in set(self.figs) - self.placed:
+        for fid in set(self.figs) - set(self.placed):
             self.gate("warning", "figure-unplaced", f"figure {fid} has no section slot ({self.figs[fid].get('section')})")
         # 11. siblings
         for name, _ in self.siblings:
