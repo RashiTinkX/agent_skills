@@ -23,11 +23,18 @@ dependencies:
   # per-script table below and the README.
   python:
     - "rdflib>=6.0"          # SPARQL over an RDF export (query_sparql.py)
-    - "httpx>=0.25"          # open-access + institutional retrieval (fetch_ezproxy.py)
+    - "httpx>=0.25"          # open-access + institutional retrieval (fetch_ezproxy.py), registry lookups (verify_citations.py)
     - "pymupdf>=1.24"        # PDF text extraction (build_corpus.py)
     - "docling"              # first extraction backend in build_corpus.py (tables + OCR)
     - "psycopg[binary]>=3.1" # article-store queries (query_postgres.py, backfill)
     - "pydantic>=2.0"        # result validation (export_review.py)
+
+  # Not pip packages: command-line tools generate_review_pdf.py shells out to.
+  # Check with `python scripts/generate_review_pdf.py --check-deps`.
+  system:
+    pandoc: "required for PDF — conda install -c conda-forge pandoc | brew install pandoc | apt-get install pandoc"
+    pdf_engine: "one of xelatex, lualatex, tectonic, pdflatex, typst, weasyprint, wkhtmltopdf, prince — lightest: conda install -c conda-forge typst (or tectonic)"
+    fc-list: "optional; picks a Unicode font for TeX engines — part of fontconfig (brew install fontconfig | apt-get install fontconfig)"
 
   # The application this skill drives. The released package on PyPI (0.0.11)
   # predates the whole-document reading, full-text-based eligibility screening,

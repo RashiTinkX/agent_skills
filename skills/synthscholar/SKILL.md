@@ -361,6 +361,31 @@ full-text availability from the length of an abstract.
 
 ## Helper scripts
 
+### Check dependencies before running — ask, don't install silently
+
+Before the first run of a script in a session, check what it needs (table
+below). If something is missing, **ask the user before installing it**: use
+`AskUserQuestion` in Claude Code, with the install command as the
+recommended option and "skip this step" as the alternative. Never `pip
+install`, `conda install` or `brew install` without that confirmation. Pick
+the command for their environment: an active conda env → `conda`/`pip`
+there, a `uv` project → `uv add`, otherwise `pip`. If they decline, say which
+step can't run and carry on with the rest.
+
+| Script | Needs | Check | Install (on confirm) |
+| --- | --- | --- | --- |
+| `verify_citations.py`, `fetch_ezproxy.py` | `httpx` | `python -c "import httpx"` | `pip install httpx` |
+| `query_sparql.py` | `rdflib` | `python -c "import rdflib"` | `pip install rdflib` |
+| `query_postgres.py`, `backfill_full_text.py` | `psycopg` | `python -c "import psycopg"` | `pip install "psycopg[binary]>=3.1"` |
+| `build_corpus.py` | `pymupdf`; `docling` optional | `python -c "import fitz"` | `pip install pymupdf` (+ `pip install docling` for scans/tables) |
+| `export_review.py`, `run_local_review.py`, `update_provenance.py` | `synthscholar` dev checkout | the script refuses with a message | `pip install -e /path/to/prisma-review-agent` (ask for the path) |
+| `generate_review_pdf.py` | `pandoc` + one PDF engine; `fc-list` optional | `python scripts/generate_review_pdf.py --check-deps` | `conda install -c conda-forge pandoc typst` (or `tectonic`); `brew install pandoc` / `apt-get install pandoc` without conda |
+| `validate_protocol.py`, `research_questions.py` | stdlib | — | — |
+
+Network services (Crossref, PubMed, Unpaywall) and `OPENROUTER_API_KEY` are
+not installs: mention them if a run will need them, and ask the user for any
+key. Never invent one.
+
 All live in [scripts/](scripts/). Run them from an environment where the
 project's deps are importable (`rdflib` for SPARQL, `psycopg[binary]>=3.1` for
 SQL; the backfill also needs the `synthscholar` package on `PYTHONPATH`). The
