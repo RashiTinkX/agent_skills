@@ -33,7 +33,7 @@ Usage:
 
     # sign in through the library now (otherwise it happens on first need)
     python fetch_ezproxy.py --login                     # proxy from your email
-    python fetch_ezproxy.py --login --institution mit   # or name it
+    python fetch_ezproxy.py --login --institution "University of Michigan"   # or umich.edu
     python fetch_ezproxy.py --logout
 
     # fill in every corpus entry that has a DOI but no full text
@@ -523,7 +523,8 @@ def main() -> int:
                       help="sign in through your library now, in a browser, and save the session")
     sign.add_argument("--logout", action="store_true", help="forget the saved library session")
     sign.add_argument("--institution", default="", metavar="NAME_OR_DOMAIN",
-                      help="your university, e.g. 'mit' or 'mit.edu' (default: from your email)")
+                      help="your university's full name or email domain, e.g. 'University of Michigan' "
+                           "or umich.edu (default: from your email)")
     sign.add_argument("--library-link", default="", metavar="URL",
                       help="any link your library gives when you open an article off campus")
     sign.add_argument("--proxy-host", default="", metavar="HOST",

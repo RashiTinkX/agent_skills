@@ -153,8 +153,8 @@ python scripts/fetch_ezproxy.py --doi-file dois.txt --pdf-dir ./pdfs   # no corp
 
 # Sign in ahead of time, name the institution, or forget the session
 python scripts/fetch_ezproxy.py --login
-python scripts/fetch_ezproxy.py --login --institution mit
-python scripts/fetch_ezproxy.py --login --library-link "https://www-nature-com.libproxy.mit.edu/…"
+python scripts/fetch_ezproxy.py --login --institution "University of Michigan"   # or umich.edu
+python scripts/fetch_ezproxy.py --login --library-link "https://www-nature-com.proxy.lib.umich.edu/…"
 python scripts/fetch_ezproxy.py --logout
 ```
 
@@ -162,12 +162,26 @@ python scripts/fetch_ezproxy.py --logout
 `--proxy-host`, then `--library-link` (any off-campus article link; the host
 is read out of it), then `--institution`. After those, the saved login, then
 `EZPROXY_HOST`, then the domain of the user's email (`SYNTHSCHOLAR_EMAIL`,
-`NCBI_EMAIL` or `git config user.email`). A domain maps through a short
-built-in table (`mit.edu → libproxy.mit.edu`), and otherwise the usual
-EZproxy hostnames for it are probed (`ezproxy.<domain>`, `libproxy.<domain>`,
-`<name>.idm.oclc.org`, …). A candidate is accepted only if the server
-answers as EZproxy. Exit 4 means none matched: ask the user which university
-they get access through, then for a library link. The URL style
+`NCBI_EMAIL` or `git config user.email`). The proxy works for any
+institution that runs EZproxy; nothing in it is specific to one university.
+- **An institution's full name** is resolved to its domain through
+  [ROR](https://ror.org), the worldwide research-organisation registry. Only
+  ROR's single confident ("chosen") match is used, never a runner-up, so a
+  user is never signed in to someone else's library. "University of Oxford"
+  becomes `ox.ac.uk`.
+- **An acronym** ("mit") is tried only as `<acronym>.edu`, because ROR
+  matches acronyms worldwide.
+- **A domain** is used as given.
+- **From a domain to the proxy:** a short built-in table, then the usual
+  EZproxy hostnames probed in parallel (`ezproxy.<domain>`,
+  `libproxy.<domain>`, `proxy.lib.<domain>`, `<name>.idm.oclc.org`, …). A
+  candidate is accepted only if the server answers as EZproxy.
+
+Exit 4 means none matched. Ask the user for their institution's full name
+or email domain, then for any link their library gives when they open an
+article off campus. The host is read straight out of that link, and this
+path covers proxies with unusual hostnames. Libraries that authenticate
+through OpenAthens or Shibboleth instead of EZproxy are not supported. The URL style
 (`hostname-suffix` or `login-url`) is read from where the login lands.
 
 **The saved session** lives in `~/.config/synthscholar/` (owner-only):

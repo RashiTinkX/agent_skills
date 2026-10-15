@@ -322,9 +322,12 @@ Hard rules:
   `fetch_ezproxy.py --login`. `--lazy-login` restores on-demand sign-in.
   Tell them it's coming ("a browser window will open; sign in with
   your library account"), and run the command with a long timeout (it waits
-  up to 5 minutes for them). The proxy is found from their email domain. If
-  the script exits 4, ask one question, "Which university or library do
-  you get journal access through?", and pass the answer as `--institution`.
+  up to 5 minutes for them). The proxy is found from their email domain,
+  for any university that runs EZproxy. If the script exits 4, ask one
+  question, "Which university or library do you get journal access
+  through?", and pass the answer as `--institution`. It takes the full
+  name (looked up in ROR) or the email domain. Never assume a particular
+  university.
   If it still exits 4, ask for any link their library gives when they open
   an article, and pass it as `--library-link`. Exit 3 means Playwright is
   missing: ask before installing it (dependency table below). Keep within

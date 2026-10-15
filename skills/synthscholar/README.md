@@ -182,7 +182,7 @@ is by feature, not version string (the package's `__version__` and its
   mostly-OA corpus needs nothing else.
 - Institutional access, for what open access can't reach: nothing to set up.
   The library session is checked when a run starts; if it is missing or expired, a browser window opens at your library's login
-  (the proxy is found from your email domain, or `--institution mit`); sign
+  (the proxy is found from your email domain, or `--institution "University of Michigan"`); sign
   in once and the session is saved and reused until it expires. Needs
   `playwright`. Setting `EZPROXY_HOST` / `EZPROXY_COOKIE_FILE` by hand still
   works and takes precedence. Requests are serialised, delayed (`EZPROXY_DELAY`) and
