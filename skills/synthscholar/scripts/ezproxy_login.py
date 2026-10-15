@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from concurrent.futures import ThreadPoolExecutor
 import re
 import shutil
 import subprocess
@@ -44,12 +46,15 @@ from urllib.parse import quote, urlparse
 
 import httpx
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ezproxy_client import _load_cookie_file  # noqa: E402  (one cookies.txt parser)
+
 MODE_HOSTNAME_SUFFIX = "hostname-suffix"
 MODE_LOGIN_URL = "login-url"
 
-# A page every EZproxy licenses: the login lands here, which proves the session
-# and shows the rewrite convention in the resulting URL.
-PROBE_TARGET = "https://www.nature.com/"
+# Sign-in and the session check both start at the proxy's bare /login: once
+# authenticated, EZproxy moves on to its own menu, so neither depends on the
+# institution licensing (or a publisher not blocking) any particular site.
 LOGIN_TIMEOUT = 300  # seconds the user has to finish signing in
 
 # Email / institution domain → EZproxy host, for institutions confirmed to use
@@ -57,9 +62,17 @@ LOGIN_TIMEOUT = 300  # seconds the user has to finish signing in
 KNOWN_PROXIES = {
     "mit.edu": "libproxy.mit.edu",
 }
-# Hostnames institutions commonly give their EZproxy, tried in order.
+# Hostnames institutions commonly give their EZproxy, in order of preference.
 PROBE_PATTERNS = ("ezproxy.{d}", "libproxy.{d}", "ezproxy.lib.{d}", "proxy.lib.{d}",
                   "login.ezproxy.{d}", "{stem}.idm.oclc.org")
+# Personal-mail domains have no library proxy; don't probe them.
+WEBMAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+           "yahoo.com", "icloud.com", "me.com", "aol.com", "proton.me", "protonmail.com",
+           "gmx.com", "gmx.de", "qq.com", "163.com", "users.noreply.github.com"}
+# Last dash-segment of a rewritten publisher host ("www-nature-com"): a TLD.
+_REWRITTEN_LABEL = re.compile(
+    r"^[a-z0-9]+(?:-{1,2}[a-z0-9]+)*-(?:com|org|net|edu|gov|int|io|info|ac|co|uk|de|fr|"
+    r"jp|ca|au|nl|ch|se|it|es|cn|in|br|ru|kr|eu|us)$")
 
 # Exit codes the CLI uses so a caller (the agent) knows what to ask the user.
 EXIT_NEEDS_INSTITUTION = 4
@@ -145,24 +158,30 @@ def logout() -> list[str]:
 
 # ─────────────────────────── which proxy ────────────────────────────
 
+def _strip_login_prefix(host: str) -> str:
+    """``login.ezproxy.uni.edu`` → ``ezproxy.uni.edu`` (EZproxy's login sub-host)."""
+    return host[len("login."):] if host.startswith("login.") else host
+
+
 def host_from_link(link: str) -> Optional[str]:
-    """Proxy host from any link the user's library gave them.
+    """Proxy host from a link the user's library gave them, or None.
 
     ``https://www-nature-com.libproxy.mit.edu/articles/…`` → ``libproxy.mit.edu``;
     ``https://ezproxy.uni.edu/login?url=…`` → ``ezproxy.uni.edu``;
     ``https://login.ezproxy.uni.edu/login?qurl=…`` → ``ezproxy.uni.edu``.
+    The candidate must answer as EZproxy, so a plain publisher link
+    (``https://www.nature.com/…``) is rejected rather than taken for a proxy.
     """
     p = urlparse(link.strip())
-    netloc = (p.netloc or "").lower().split("@")[-1].split(":")[0]
+    netloc = (p.hostname or "").lower()
     if not netloc:
         return None
-    if p.path.lower().startswith("/login") or re.search(r"[?&]q?url=", p.query or ""):
-        return netloc[len("login."):] if netloc.startswith("login.") else netloc
     first, _, rest = netloc.partition(".")
-    # a rewritten publisher host: "www-nature-com" — dashes where dots were
-    if "-" in first and rest.count(".") >= 1:
-        return rest
-    return netloc
+    if _REWRITTEN_LABEL.match(first) and rest.count(".") >= 1:
+        cand = rest                       # a rewritten publisher host
+    else:
+        cand = _strip_login_prefix(netloc)
+    return cand if is_ezproxy(cand) or is_ezproxy("login." + cand) else None
 
 
 def _email_domains() -> list[str]:
@@ -184,7 +203,7 @@ def _registrable(domain: str) -> str:
     return ".".join(parts[-2:])
 
 
-def is_ezproxy(host: str, timeout: float = 8.0) -> bool:
+def is_ezproxy(host: str, timeout: float = 5.0) -> bool:
     """Does ``host`` answer as an EZproxy server?"""
     try:
         r = httpx.get(f"https://{host}/login", timeout=timeout, follow_redirects=False)
@@ -196,15 +215,17 @@ def is_ezproxy(host: str, timeout: float = 8.0) -> bool:
 
 
 def host_for_domain(domain: str) -> Optional[str]:
+    """The domain's EZproxy host: the known table, else the first probe that answers."""
     d = _registrable(domain)
     if d in KNOWN_PROXIES:
         return KNOWN_PROXIES[d]
+    if d in WEBMAIL or domain.lower() in WEBMAIL:
+        return None
     stem = d.split(".")[0]
-    for pat in PROBE_PATTERNS:
-        cand = pat.format(d=d, stem=stem)
-        if is_ezproxy(cand):
-            return cand[len("login."):] if cand.startswith("login.") else cand
-    return None
+    cands = [pat.format(d=d, stem=stem) for pat in PROBE_PATTERNS]
+    with ThreadPoolExecutor(max_workers=len(cands)) as pool:   # one timeout, not six
+        hits = list(pool.map(is_ezproxy, cands))
+    return next((_strip_login_prefix(c) for c, ok in zip(cands, hits) if ok), None)
 
 
 def resolve_host(proxy_host: str = "", library_link: str = "", institution: str = "") -> tuple[str, str]:
@@ -248,47 +269,82 @@ def resolve_host(proxy_host: str = "", library_link: str = "", institution: str 
 
 # ─────────────────────────── session ────────────────────────────
 
-def login_url(host: str, target: str = PROBE_TARGET) -> str:
-    """The proxy's starting URL for ``target``.
+def login_url(host: str, target: str = "") -> str:
+    """The proxy's sign-in URL, optionally continuing to ``target``.
 
     ``qurl=`` carries the target percent-encoded; ``url=`` must be raw, and an
-    encoded value there doesn't match any configured database, so EZproxy shows
-    its menu page instead of the article.
+    encoded value there matches no configured database, so EZproxy shows its
+    menu page instead of the article.
     """
-    return f"https://{host}/login?qurl={quote(target, safe='')}"
+    return f"https://{host}/login" + (f"?qurl={quote(target, safe='')}" if target else "")
 
 
-def _cookie_dict(cookie_file: str) -> dict[str, str]:
-    out = {}
-    try:
-        for line in Path(cookie_file).read_text(encoding="utf-8").splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 7 and not line.startswith("#"):
-                out[parts[5]] = parts[6]
-    except OSError:
-        pass
-    return out
+def through_proxy(url: str, host: str) -> Optional[str]:
+    """The rewrite mode if ``url`` is a page past the proxy's sign-in, else None.
+
+    Past sign-in means: on a rewritten publisher host (``*.host`` →
+    ``hostname-suffix``), or on the proxy itself, including ``login.host`` and a
+    proxy-by-port ``host:2048``, anywhere but its login pages (its menu).
+    ``login-url`` is returned when the form can't be told from the URL. It is the
+    universal one: every EZproxy accepts ``/login?qurl=`` and redirects onwards.
+    """
+    u = urlparse(url)
+    h = (u.hostname or "").lower()
+    on_login = u.path.lower().startswith(("/login", "/connect", "/logout"))
+    if h.endswith("." + host) and not h.startswith("login."):
+        return MODE_HOSTNAME_SUFFIX
+    if h == "login." + host and not on_login:
+        return MODE_HOSTNAME_SUFFIX     # login.* sub-host = proxy by hostname
+    if h == host and not on_login:
+        return MODE_LOGIN_URL
+    return None
 
 
 def session_valid(host: str, cookie_file: str, timeout: float = 20.0) -> Optional[bool]:
-    """True = the proxy lets this session through; False = expired; None = can't tell."""
+    """True = the proxy lets this session through; False = expired; None = can't tell.
+
+    Asks the proxy alone: an authenticated /login moves on to the proxy's menu,
+    an expired one bounces to the login form or the identity provider.
+    """
     jar = httpx.Cookies()
-    for name, value in _cookie_dict(cookie_file).items():
-        jar.set(name, value, domain=f".{host}")
+    for c in _saved_cookies(cookie_file):
+        jar.set(c["name"], c["value"], domain=c["domain"])
     try:
-        r = httpx.get(login_url(host), cookies=jar,
-                      timeout=timeout, follow_redirects=True)
+        r = httpx.get(login_url(host), cookies=jar, timeout=timeout, follow_redirects=True)
     except httpx.HTTPError:
         return None
-    final = urlparse(str(r.url))
-    netloc = final.netloc.lower()
-    through = netloc.endswith("." + host) or (netloc == host and not final.path.lower().startswith("/login"))
-    return bool(through and r.status_code < 400)
+    if r.status_code >= 500:
+        return None
+    return through_proxy(str(r.url), host) is not None
+
+
+def _saved_cookies(cookie_file: str) -> list[dict]:
+    """(name, value, domain) of the saved cookies, domains kept for the jar."""
+    out = []
+    names = _load_cookie_file(cookie_file)
+    try:
+        lines = Path(cookie_file).expanduser().read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        parts = line.removeprefix("#HttpOnly_").split("\t")
+        if len(parts) >= 7 and not line.startswith("# ") and parts[5] in names:
+            out.append({"name": parts[5], "value": parts[6], "domain": parts[0]})
+    return out
 
 
 def _proxy_cookies(cookies: list[dict], host: str) -> list[dict]:
-    return [c for c in cookies
-            if (c.get("domain") or "").lstrip(".").endswith(host)]
+    """The proxy's own session cookies: domain ``host`` or ``login.host`` only.
+
+    Not publisher or sibling-host cookies, which would collide by name when the
+    client flattens the jar; the ``host`` one wins a name clash.
+    """
+    keep = {}
+    for c in cookies:
+        d = (c.get("domain") or "").lstrip(".").lower()
+        if d in (host, "login." + host) and (c["name"] not in keep or d == host):
+            keep[c["name"]] = c
+    return list(keep.values())
 
 
 def browser_login(host: str, source: str, timeout: int = LOGIN_TIMEOUT) -> dict:
@@ -329,29 +385,21 @@ def browser_login(host: str, source: str, timeout: int = LOGIN_TIMEOUT) -> dict:
                                  "your library's proxy? Pass --library-link or --institution.")
             deadline = time.monotonic() + timeout
             mode = None
-            while time.monotonic() < deadline:
-                if not ctx.pages:
-                    raise LoginError("The browser window was closed before sign-in finished.")
-                for pg in ctx.pages:
-                    u = urlparse(pg.url)
-                    netloc = u.netloc.lower()
-                    on_login = u.path.lower().startswith(("/login", "/connect"))
-                    if netloc.endswith("." + host) and not netloc.startswith("login.") \
-                            or netloc == "login." + host and not on_login:
-                        # a rewritten publisher host, or the proxy's menu after sign-in
-                        mode = MODE_HOSTNAME_SUFFIX
-                    elif netloc == host and not on_login \
-                            and any(c["name"].lower().startswith("ezproxy")
-                                    for c in _proxy_cookies(ctx.cookies(), host)):
-                        mode = MODE_LOGIN_URL
-                if mode:
-                    break
-                # not time.sleep: the sync API only processes browser events
-                # inside its own calls, so pg.url would never change
-                ctx.pages[0].wait_for_timeout(1000)
+            try:
+                while time.monotonic() < deadline and not mode:
+                    if not ctx.pages:
+                        raise LoginError("The browser window was closed before sign-in finished.")
+                    mode = next((m for m in (through_proxy(pg.url, host) for pg in ctx.pages) if m), None)
+                    if not mode:
+                        # not time.sleep: the sync API only processes browser events
+                        # inside its own calls, so pg.url would never change
+                        ctx.pages[0].wait_for_timeout(1000)
+                cookies = _proxy_cookies(ctx.cookies(), host) if mode else []
+            except PwError as e:
+                raise LoginError("The browser closed before sign-in finished "
+                                 f"({str(e).splitlines()[0]}).")
             if not mode:
                 raise LoginError(f"Sign-in didn't finish within {timeout // 60} minutes.")
-            cookies = _proxy_cookies(ctx.cookies(), host)
         finally:
             try:
                 ctx.close()

@@ -155,12 +155,19 @@ class AutoLoginFetcher:
             return
         try:
             ezproxy_login.ensure_session(force=cfg.enabled, **self._login_kwargs)
-        except ezproxy_login.LoginError as e:
+        except Exception as e:  # a failed sign-in must not lose the rest of the run
             self.login_error = str(e)
             print(f"NOTE  institutional access unavailable: {e}", file=sys.stderr)
             return
         self._inner.close()
         self._inner = self._make(proxy_config(self._Config))
+
+    @property
+    def can_sign_in(self) -> bool:
+        """Configured already, or able to open a browser to sign in."""
+        import importlib.util
+        return self._inner.config.enabled or (
+            self._allow and importlib.util.find_spec("playwright") is not None)
 
     @property
     def ready(self) -> bool:
@@ -493,7 +500,7 @@ def main() -> int:
     if not args.corpus and not dois:
         ap.error("give --corpus and/or --doi/--doi-file (or --status)")
 
-    usable = (oa is not None) or fetcher is not None
+    usable = (oa is not None) or (fetcher is not None and fetcher.can_sign_in)
     if not usable and not args.dry_run:
         print("ERROR: no retrieval route available.", file=sys.stderr)
         print(_status_lines(), file=sys.stderr)
