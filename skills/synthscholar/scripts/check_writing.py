@@ -60,6 +60,12 @@ SKIP_KEYS = {
     "search_strategy", "label", "dimension", "source_id", "title", "pmid", "pmids",
     "doi", "references", "representative_pmids", "supporting_pmids", "id", "rating",
     "certainty", "overall", "judgement", "judgment", "status", "outcome", "domain_name",
+    # inside prisma_review: per-study extraction, appraisal items, protocol inputs,
+    # flow counts — data and quotes, not the review's prose
+    "inclusion_criteria", "exclusion_criteria", "data_extraction_schema", "data_extraction",
+    "critical_appraisal_results", "extracted_studies", "study_selection",
+    "prisma_flow_summary", "output_format", "suggested_visualizations",
+    "quote", "quotes", "verbatim", "evidence_text", "field_answers",
 }
 
 # ─────────────────────────── patterns ────────────────────────────
@@ -99,7 +105,7 @@ PATTERNS: list[tuple[str, str, str, str, str]] = [
      r"(research|studies|evidence|literature) (has |have )?(consistently )?(shown|show|demonstrated|suggest(s|ed)?))\b",
      "5/26", "cite the studies and give the count"),
     ("generic-conclusion", "warning",
-     r"\b(paves? the way|pave the way|open(s|ing)? (up )?new avenues|holds? (great |much |significant )?promise|"
+     r"\b(pav(e|es|ed|ing) the way|open(s|ing)? (up )?new avenues|holds? (great |much |significant )?promise|"
      r"the future (looks|is) bright|exciting (new )?(avenues|opportunities|future)|"
      r"remains? to be seen|only time will tell)\b", "24", "name the gap and the study that would close it"),
     ("causal-overclaim", "warning",
@@ -112,8 +118,10 @@ PATTERNS: list[tuple[str, str, str, str, str]] = [
      "give the test statistic, or the magnitude"),
     ("vague-quantifier", "warning",
      r"\b(many|numerous|several|various|a (large |small )?number of|a (wide |broad )?range of|"
-     r"a (vast )?majority of|most|a few|a handful of|countless) (of the )?"
-     r"(studies|trials|papers|articles|reports|participants|patients|samples|cohorts|datasets)\b",
+     r"(a|the) (vast )?majority of|most|a few|a handful of|countless|some)\s+"
+     r"(of\s+(the|these|those)\s+)?((included|eligible|identified|reviewed|primary|other|such|"
+     r"available|existing|prior|previous|recent)\s+)?"
+     r"(studies|study|trials|papers|articles|reports|participants|patients|samples|cohorts|datasets)\b",
      "31", "give the count: 'seven of 12 studies'"),
     ("unquantified-magnitude", "warning",
      r"\b(substantially|dramatically|markedly|considerably|greatly|vastly|drastically|massively|"
@@ -159,10 +167,16 @@ PATTERNS: list[tuple[str, str, str, str, str]] = [
 ]
 COMPILED = [(c, s, re.compile(rx, re.I), n, a) for c, s, rx, n, a in PATTERNS]
 # A sentence that carries its own statistic is allowed "significant(ly)".
+# A reported value, not the word "statistically" or the name of a test: the
+# style requires the number ("p = 0.01") next to "significant".
 STATISTIC = re.compile(
-    r"(\bp\s*[<=>≤≥]|\bCI\b|confidence interval|\b(OR|HR|RR|SMD|MD|IRR|AUC|AUROC|β|beta|"
-    r"χ2|χ²|chi-?square|I2|I²|r|ρ|d|g)\s*[=:]|\bt\(\d|\bF\(\d|\bz\s*=|statistically|"
-    r"\b(test|regression|ANOVA|Wilcoxon|Mann-Whitney)\b)", re.I)
+    r"(\bp\s*[<=>≤≥]\s*0?\.\d|\b\d{2}\s?%\s*CI\b|\bCI\s*[:,]?\s*-?\d|confidence interval\s*[:,]?\s*-?\d|"
+    r"\b(OR|HR|RR|SMD|MD|IRR|AUC|AUROC|β|beta|χ2|χ²|I2|I²|r|ρ|d|g)\s*[=:]\s*-?\d|"
+    r"\bt\(\d+\)\s*=|\bF\(\d+\s*,\s*\d+\)\s*=|\bz\s*=\s*-?\d)", re.I)
+# Digits that are not quantities: citation years, PMIDs, reference and table numbers.
+NON_QUANTITY = re.compile(
+    r"\((?:[^()]*?\b(?:19|20)\d\d[a-z]?\b[^()]*?)\)|\[\d+(?:[-–,]\s*\d+)*\]|"
+    r"\bPMIDs?\s*:?\s*\w+|\b(?:19|20)\d\d[a-z]?\b|\b(?:Table|Figure|Fig\.|RQ|SQ|Q)\s?\d+(\.\d+)*", re.I)
 HAS_NUMBER = re.compile(r"\d")
 EM_DASH = re.compile(r"—|(?<=\s)--(?=\s)")
 SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])")
@@ -175,31 +189,39 @@ def sentences(text: str) -> list[str]:
     return [s for s in SENTENCE_SPLIT.split(flat) if s]
 
 
+def _has_quantity(sentence: str) -> bool:
+    """A number that is a quantity, once citations, years and table refs are removed."""
+    return bool(HAS_NUMBER.search(NON_QUANTITY.sub(" ", sentence)))
+
+
 def check_text(text: str, location: str, quoted: bool = False) -> list[dict]:
-    """Findings for one prose field."""
+    """Findings for one prose field: every match of every pattern, per sentence."""
     out: list[dict] = []
     for sent in sentences(text):
+        # typographic apostrophes are what generated prose usually carries
+        norm = sent.replace("\u2019", "'").replace("\u2018", "'")
         for code, sev, rx, num, advice in COMPILED:
-            m = rx.search(sent)
-            if not m:
+            if code == "significant-without-test" and STATISTIC.search(norm):
                 continue
-            if code == "significant-without-test" and STATISTIC.search(sent):
-                continue
-            if code in ("vague-quantifier", "unquantified-magnitude") and HAS_NUMBER.search(sent):
+            if code in ("vague-quantifier", "unquantified-magnitude") and _has_quantity(norm):
                 continue   # the number is there; the word may just be context
-            if code == "reader-address" and re.search(r"\byou(r)?\b", sent) is None:
-                continue
-            if quoted:
-                sev = "info" if sev == "info" else "warning"   # quoted text: never an error
-            out.append({"code": code, "severity": sev, "pattern": num, "advice": advice,
-                        "match": m.group(0), "sentence": sent[:400], "location": location})
+            seen = set()
+            for m in rx.finditer(norm):
+                word = m.group(0).lower()
+                if word in seen:
+                    continue
+                seen.add(word)
+                out.append({"code": code, "severity": ("info" if sev == "info" else "warning")
+                            if quoted else sev, "pattern": num, "advice": advice,
+                            "match": m.group(0), "sentence": sent[:400], "location": location,
+                            "quoted": quoted})
     dashes = len(EM_DASH.findall(text or ""))
     words = len((text or "").split())
     if dashes > 2 and dashes * 100 > words:
         out.append({"code": "em-dash-density", "severity": "warning", "pattern": "13",
                     "advice": "commas or separate sentences; at most one parenthetical dash per paragraph",
                     "match": f"{dashes} em dashes in {words} words", "sentence": "",
-                    "location": location})
+                    "location": location, "quoted": quoted})
     return out
 
 
@@ -232,34 +254,59 @@ def check_review(review: dict, include_quoted: bool) -> list[dict]:
     return findings
 
 
+# Sections of the exported review.md that are inputs, data or quotes, not the
+# review's prose (matched against heading text, case-insensitive).
+MD_SKIP_SECTIONS = re.compile(
+    r"(eligibility criteria|information sources|search strategy|selection process|"
+    r"prisma flow|research.questions?|appendix|evidence spans|data (extraction|charting)|"
+    r"critical appraisal|risk of bias assessment|provenance|run configuration|"
+    r"invocation|iteration|other information|registration)", re.I)
+
+
 def check_markdown(text: str) -> list[dict]:
-    """The body up to the reference list: no code, tables, headings or quotes."""
+    """The body up to the reference list: prose paragraphs only.
+
+    Skipped: fenced and indented code, inline code spans, tables, headings,
+    block quotes, HTML comments, list items that are questions, and the
+    sections listed in ``MD_SKIP_SECTIONS`` (protocol inputs, flow counts,
+    appendices of extracted data).
+    """
     m = re.search(r"^#{1,3}\s*(?:\d+\.?\s*)?(References|Bibliography)\s*$", text, re.M | re.I)
-    body = text[:m.start()] if m else text
+    body = re.sub(r"<!--.*?-->", "", text[:m.start()] if m else text, flags=re.S)
     findings: list[dict] = []
-    section, para, fence = "body", [], False
+    section, para, fence, skipping = "body", [], None, False
 
     def flush() -> None:
-        if para:
+        if para and not skipping:
             findings.extend(check_text(" ".join(para), section))
-            para.clear()
+        para.clear()
 
     for line in body.split("\n"):
-        if re.match(r"^\s*(```|~~~)", line):
-            fence = not fence
+        f = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence is None and f:
+            fence = f.group(1)
             flush()
             continue
-        if fence:
+        if fence is not None:
+            st = line.strip()
+            if st and set(st) == {fence[0]} and len(st) >= len(fence):
+                fence = None
             continue
         h = re.match(r"^#{1,6}\s+(.*)", line)
         if h:
             flush()
             section = h.group(1).strip()
+            skipping = bool(MD_SKIP_SECTIONS.search(section))
             continue
-        if not line.strip() or line.lstrip().startswith(("|", ">", "<!--")) or re.match(r"^\s*(---|\*\*\*)\s*$", line):
+        if (not line.strip() or line.lstrip().startswith(("|", ">"))
+                or re.match(r"^\s*(---|\*\*\*|\* \* \*)\s*$", line)
+                or (not para and re.match(r"^( {4}|\t)", line))):     # indented code
             flush()
             continue
-        para.append(re.sub(r"^\s*([-*+]|\d+\.)\s+", "", line))
+        item = re.sub(r"^\s*([-*+]|\d+\.)\s+", "", line)
+        if item.rstrip().endswith("?") or re.match(r"^\*\*(Question|Q\d)", item):
+            continue   # a question being asked, not a rhetorical one
+        para.append(re.sub(r"`[^`]*`", " ", item))
     flush()
     return findings
 
@@ -267,20 +314,27 @@ def check_markdown(text: str) -> list[dict]:
 # ─────────────────────────── report ────────────────────────────
 
 def summarise(findings: list[dict]) -> dict:
+    """Counts of the review's own findings; quoted-text findings (--all) are
+    reported separately and never fail the exit code — they can't be rewritten."""
     by_code: dict[str, int] = {}
-    for f in findings:
+    own = [f for f in findings if not f.get("quoted")]
+    for f in own:
         by_code[f["code"]] = by_code.get(f["code"], 0) + 1
-    return {"errors": sum(f["severity"] == "error" for f in findings),
-            "warnings": sum(f["severity"] == "warning" for f in findings),
-            "info": sum(f["severity"] == "info" for f in findings),
+    return {"errors": sum(f["severity"] == "error" for f in own),
+            "warnings": sum(f["severity"] == "warning" for f in own),
+            "info": sum(f["severity"] == "info" for f in own),
+            "quoted_text_notes": len(findings) - len(own),
             "by_code": dict(sorted(by_code.items(), key=lambda kv: -kv[1]))}
 
 
 def render_markdown(findings: list[dict], summary: dict, source: str) -> str:
     out = [f"# Writing check — {Path(source).name}\n",
            f"**{summary['errors']} error(s), {summary['warnings']} warning(s), {summary['info']} note(s).** "
-           "Rewrite flagged sentences in the review JSON following "
-           "`references/writing_style.md`; never change numbers, citations or quoted text.\n"]
+           + ("Rewrite flagged sentences in the review JSON, following "
+              if source.endswith(".json") else
+              "Rewrite flagged sentences in their source (for an exported review, in "
+              "review.json, then re-export), following ")
+           + "`references/writing_style.md`; never change numbers, citations or quoted text.\n"]
     if summary["by_code"]:
         out.append("| Pattern | Count |\n| --- | --- |")
         out += [f"| {k} | {v} |" for k, v in summary["by_code"].items()]
@@ -346,7 +400,9 @@ def main() -> int:
             if f["severity"] != "info":
                 print(f"[{f['severity']:>7}] {f['code']:<28} {f['location']}: “{f['match']}”", file=sys.stderr)
     print(f"\n{summary['errors']} error(s), {summary['warnings']} warning(s), {summary['info']} note(s)"
-          f" | report: {base}.writing.md", file=sys.stderr)
+          + (f", {summary['quoted_text_notes']} in quoted study text (not failing)"
+             if summary["quoted_text_notes"] else "")
+          + f" | report: {base}.writing.md", file=sys.stderr)
     return 1 if summary["errors"] or (args.strict and summary["warnings"]) else 0
 
 
