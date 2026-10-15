@@ -49,6 +49,7 @@ dependencies:
     export_review.py: "synthscholar development checkout"
     update_provenance.py: "synthscholar (models only)"
     verify_citations.py: "httpx; Crossref, doi.org, NCBI E-utilities — no credentials"
+    generate_review_pdf.py: "pandoc + one engine (xelatex, lualatex, tectonic, pdflatex, typst, weasyprint, wkhtmltopdf, prince); stdlib otherwise"
     query_sparql.py: "rdflib"
     query_postgres.py: "psycopg[binary]"
     backfill_full_text.py: "psycopg[binary] + synthscholar, migration 006 applied"

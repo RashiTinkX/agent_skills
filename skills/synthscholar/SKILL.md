@@ -1,6 +1,6 @@
 ---
 name: synthscholar
-version: 0.4.0
+version: 0.5.0
 description: Set up, run, and query SynthScholar / PRISMA systematic reviews. (1) Protocol intake — draft a complete protocol (research question, PICO, eligibility, databases, risk-of-bias tool, charting, per-group analysis, registration) and validate it before a run. (2) Provenance queries over a finished review — full-text vs abstract-only inclusions, retrieval routes, and the screening audit trail (decisions on full text vs abstract, exclusion reasons per stage), via SPARQL over the RDF export or SQL over the article store. (3) Bring-your-own-corpus review — the user supplies PDFs, or DOIs whose full text is fetched open access (Unpaywall, OpenAlex, Semantic Scholar) then via their own institutional EZproxy access; produces the full PRISMA review (screening, charting, appraisal, synthesis) as Markdown and SLR-ontology Turtle. Use when asked to start or scope a review, run a review over supplied PDFs, get full text for a DOI, export a review to md/ttl, or audit full-text and screening provenance.
 license: Apache-2.0
 ---
@@ -167,6 +167,11 @@ python scripts/update_provenance.py out/review.json \
 # 6. Citations — gate before handing the review over (exit 1 on errors)
 python scripts/verify_citations.py out/review.json
 python scripts/verify_citations.py out/review.json --apply out/review.verified.json
+
+# 7. PDF (optional) — refuses while the citation report has errors
+python scripts/verify_citations.py out/review.json --style vancouver
+python scripts/generate_review_pdf.py out/review.md --references vancouver \
+    --include charting appraisal citations
 ```
 
 Step 4 needs `OPENROUTER_API_KEY` and the `synthscholar` package — it drives
@@ -243,7 +248,14 @@ python scripts/research_questions.py out/review.json --outdir out/ --themes them
   make a citation pass by inventing a DOI or by adopting a `doi-candidate`
   the user hasn't confirmed. Finding codes and the response to each:
   [references/citation_verification.md](references/citation_verification.md).
-- **Always offer both exports.** `.md` to read, `.ttl` to ingest.
+- **Always offer both exports.** `.md` to read, `.ttl` to ingest. Offer a PDF
+  (`generate_review_pdf.py`) when the review is going to people: it renders
+  `review.md` as is, so fix content in `review.json` and re-export rather than
+  editing the PDF's source. It stops while `review.citations.json` reports
+  errors. Pass `--allow-citation-errors` only when the user explicitly accepts
+  a PDF with unresolved citations, and say so when you hand it over.
+  Needs `pandoc` and one engine (`--check-deps`). `typst` or `tectonic` from
+  conda-forge is the lightest install.
 - **Ingesting into BrainKB is the `brainkb` skill's job — hand off, don't
   improvise.** Its *"Ingest a SynthScholar review"* section owns the graph IRI
   (`https://brainkb.org/synthscholar/reviews/<review_id>/`, registered to a
@@ -292,6 +304,8 @@ parity: `slr:content_hash` in RDF equals `article_full_text.content_sha256`.
   DOIs/PMIDs real and pointing at the cited paper, retractions, in-text
   citations matching the included studies, or a reference list in APA /
   Nature / Vancouver / IEEE.
+- Wants the review **as a PDF**, optionally with the charting / appraisal /
+  per-group / citation report appended.
 
 **Queries (Mode 2)** — when the user asks to:
 
@@ -376,6 +390,8 @@ python scripts/research_questions.py out/review.json --outdir out/   # retrofit 
 python scripts/update_provenance.py out/review.json --provenance search_provenance.json
 python scripts/verify_citations.py out/review.json                     # citation gate
 python scripts/verify_citations.py out/review.json --style apa --apply out/review.verified.json
+python scripts/generate_review_pdf.py out/review.md --references apa --include charting appraisal
+python scripts/generate_review_pdf.py --check-deps                     # pandoc + engine?
 
 # SPARQL over an RDF export — named recipe or your own query
 python scripts/query_sparql.py review.ttl --query included-full-text
