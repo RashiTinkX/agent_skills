@@ -1,0 +1,1180 @@
+#!/usr/bin/env python3
+"""Verify the citations in a generated review against the registries.
+
+A DOI that resolves is not proof a citation is right; the failure that matters
+in a generated review is a *real* DOI or PMID attached to the *wrong* paper, a
+study cited in the prose that the review never included, or a retracted paper
+carried into the synthesis. Printing registry metadata and leaving the
+comparison to a reader does not catch those at 170 studies, so this script
+makes the comparison itself and grades every finding.
+
+Two layers, run over a ``PRISMAReviewResult`` JSON (``review.json``):
+
+1. **Reference metadata** — each included article's identifiers against the
+   registry that owns them:
+
+   * DOI → Crossref REST (``/works/{doi}``); not in Crossref → the DOI handle
+     server, then CSL-JSON content negotiation for DataCite / mEDRA / … records.
+     The registered title, first author and year are compared with what the
+     review claims; a title that does not match means the DOI belongs to a
+     different paper.
+   * Retractions are looked up from the **paper's** side — Crossref's
+     ``updated-by`` (Retraction Watch-backed) plus the ``updates:{doi}`` filter,
+     which returns the notices pointing at it. ``update-to`` sits on the notice,
+     so reading only that misses every cited retracted paper.
+   * PMID → NCBI E-utilities ``esummary`` (batched): exists, title matches,
+     PubMed's DOI agrees with the claimed one, not a "Retracted Publication".
+     BYO-corpus ids (``local_…``) are not PMIDs and are skipped.
+   * No DOI → a Crossref bibliographic search proposes a *candidate*, shown only
+     when its title matches near-exactly. Candidates are never applied.
+
+2. **In-text citations** — every ``PMID:`` / DOI / ``(Author et al., Year)``
+   in the generated prose (synthesis, discussion, per-group answers, GRADE,
+   …) must resolve to an included study. A citation of a record the screening
+   log excluded, or of an id that appears nowhere in the review, is an error;
+   an author–year paired with a PMID that belongs to someone else is a warning.
+
+A rendered Markdown file (``review.md``, or any manuscript) is accepted too;
+without the JSON there is no included set, so it verifies the DOIs it finds and
+matches author–year citations against the reference list.
+
+Severity: **error** (fails the gate: unregistered DOI, DOI → different paper,
+retracted, cited study not included / unknown id), **warning** (partial title,
+author or year disagreement, expression of concern, missing DOI, lookup
+failed), **info** (correction notices, ±1 year, preprint with a published
+version, included-but-never-cited).
+
+Usage:
+    python verify_citations.py out/review.json
+    python verify_citations.py out/review.json --style vancouver      # + reference list
+    python verify_citations.py out/review.json --apply out/review.verified.json
+    python verify_citations.py out/review.json --offline              # in-text only
+    python verify_citations.py manuscript.md --check-urls
+
+Writes ``<base>.citations.json`` and ``<base>.citations.md`` next to the input
+(``--outdir`` to change). Exit 0 = no errors, 1 = errors (or warnings with
+``--strict``), 2 = bad input.
+
+``--apply`` writes a corrected copy, changing only what a registry confirms:
+DOI spelling normalised, empty title/year/journal/authors filled from a record
+whose title matched, and a missing DOI taken from PubMed for a verified PMID.
+Re-export from the corrected copy; a newly filled DOI changes the article's RDF
+IRI (PMID → DOI → hash), so re-ingest rather than patch a graph already loaded.
+
+Contact address for the Crossref polite pool / NCBI: ``--mailto`` or
+``SYNTHSCHOLAR_EMAIL`` (also ``NCBI_EMAIL``); ``NCBI_API_KEY`` lifts the
+E-utilities rate limit. Needs only ``httpx``.
+"""
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any, Iterable, Optional
+from urllib.parse import quote
+
+import httpx
+
+CROSSREF = "https://api.crossref.org/works"
+HANDLE = "https://doi.org/api/handles/"
+DOI_RESOLVER = "https://doi.org/"
+ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+
+# DOI = "10." + registrant + "/" + suffix. The suffix may legally contain
+# ".", ";", "(" and ")" (Elsevier's 10.1016/S0140-6736(09)60937-1), so
+# sentence punctuation is stripped afterwards by _trim(), not excluded here.
+DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
+DOI_FORM = re.compile(r"^10\.\d{4,9}/\S+$")
+URL_RE = re.compile(r"https?://[^\s<>)\]\"'|]+")
+# "PMID: 123", "PMID:123", "PMIDs: 1, 2", "PMID local_ab12cd34"
+PMID_RE = re.compile(r"\bPMIDs?\s*[:#]?\s*((?:(?:local_[0-9a-f]+|\d{1,9})(?:\s*(?:,|and|&)\s*)?)+)",
+                     re.IGNORECASE)
+PMID_ID = re.compile(r"local_[0-9a-f]+|\d{1,9}", re.IGNORECASE)
+REAL_PMID = re.compile(r"^\d{1,9}$")
+# "Smith et al., 2023", "Smith and Jones 2021", "Smith & Jones, 2021a", "O'Neil-Ray 2020"
+SURNAME = r"[A-Z][\w'’\-]+(?:\s(?:van|von|de|der|da|del|la|le)\s[A-Z][\w'’\-]+)?"
+AUTHOR_YEAR_RE = re.compile(
+    rf"({SURNAME})(?:\s+et\s+al\.?|\s+(?:and|&)\s+{SURNAME})?,?\s+((?:19|20)\d\d)[a-z]?\b"
+)
+PAREN_RE = re.compile(r"\(([^()]{4,400})\)")
+# Capitalised words that precede a year in prose without being a surname.
+NOT_SURNAMES = {
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "since", "from", "in", "by",
+    "before", "after", "until", "during", "through", "between", "version", "wave",
+    "phase", "table", "figure", "fig", "supplementary", "prisma", "grade", "rob",
+    "cohort", "spring", "summer", "autumn", "fall", "winter", "the", "and", "or",
+    "year", "years", "published", "accessed", "updated", "covid", "sars", "who",
+}
+TRAILING = ".,;:'\""
+
+# Matching thresholds on normalised titles.
+TITLE_MATCH = 0.90
+TITLE_PARTIAL = 0.70
+
+# Crossref update types, graded. Anything unlisted is informational.
+UPDATE_ERROR = {"retraction", "withdrawal", "removal"}
+UPDATE_WARNING = {"partial_retraction", "expression_of_concern"}
+
+# Top-level review fields that are inputs, logs or run metadata, not generated
+# prose; ids in them are not citations.
+NON_PROSE = {
+    "included_articles", "screening_log", "protocol", "search_queries", "flow",
+    "run_configuration", "plan_iterations", "agent_invocations",
+    "search_iterations", "cache_matched_criteria", "quality_checklist",
+    "timestamp", "grounding_validation", "cache_hit", "cache_similarity_score",
+}
+STRUCTURED_ID_KEYS = {"paper_pmid", "pmid"}  # plus any key ending in "_pmids"
+
+SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2}
+
+
+# ─────────────────────────── normalisation ────────────────────────────
+
+def _trim(doi: str) -> str:
+    """Strip sentence punctuation and unbalanced closing parens from a DOI match."""
+    doi = doi.rstrip(TRAILING)
+    while doi.endswith(")") and doi.count(")") > doi.count("("):
+        doi = doi[:-1].rstrip(TRAILING)
+    return doi
+
+
+def clean_doi(doi: str) -> str:
+    """Bare DOI from any of the URL / ``doi:`` forms, without trailing junk."""
+    d = (doi or "").strip()
+    d = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", d, flags=re.IGNORECASE)
+    return _trim(d.strip())
+
+
+def norm_text(s: str) -> str:
+    """Lower-case, accent-folded, tag- and punctuation-free text for comparison."""
+    s = html.unescape(re.sub(r"<[^>]+>", " ", s or ""))
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def title_similarity(a: str, b: str) -> float:
+    """Similarity of two titles in [0, 1]; a truncated title or one missing its
+    subtitle still scores as a match."""
+    na, nb = norm_text(a), norm_text(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    short, long_ = sorted((na, nb), key=len)
+    if len(short) >= 30 and long_.startswith(short):
+        return 0.95
+    return SequenceMatcher(None, na, nb).ratio()
+
+
+def title_in_line(title: str, line: str) -> float:
+    """Share of a registry title's words present in a free-text reference line."""
+    words = norm_text(title).split()
+    have = set(norm_text(line).split())
+    return sum(w in have for w in words) / len(words) if words else 0.0
+
+
+def first_year(s: str) -> Optional[int]:
+    m = re.search(r"(?:19|20)\d\d", s or "")
+    return int(m.group()) if m else None
+
+
+def years_close(claimed: str, cited: str, tol: int = 1) -> bool:
+    y = first_year(claimed)
+    return y is not None and abs(y - int(cited)) <= tol
+
+
+def first_author_segment(authors: str) -> str:
+    """The first author out of a free-text author string.
+
+    Handles "Smith J, Jones K" (PubMed), "Smith, J.; Jones, K.", "Smith, J., ..."
+    and "John Smith, Jane Doe": the surname is somewhere in the returned words.
+    """
+    a = (authors or "").strip()
+    if ";" in a:
+        return a.split(";")[0]
+    return a.split(",")[0]
+
+
+def surname_matches(surname: str, authors: str) -> bool:
+    target = norm_text(surname)
+    seg = norm_text(first_author_segment(authors))
+    return bool(target) and (f" {target} " in f" {seg} " or seg.replace(" ", "") == target.replace(" ", ""))
+
+
+# ─────────────────────────── HTTP ────────────────────────────
+
+class Registry:
+    """Thin client for Crossref, the DOI handle server, DOI content negotiation
+    and NCBI E-utilities, with retry on throttling."""
+
+    def __init__(self, mailto: str = "", delay: float = 0.2, timeout: float = 20.0):
+        self.mailto = mailto
+        self.delay = delay
+        ua = "synthscholar-skill-verify-citations/1.0"
+        if mailto:
+            ua += f" (mailto:{mailto})"
+        self.http = httpx.Client(timeout=timeout, follow_redirects=True,
+                                 headers={"User-Agent": ua})
+        self.ncbi_key = (os.environ.get("NCBI_API_KEY") or "").strip()
+
+    def close(self) -> None:
+        self.http.close()
+
+    def _get(self, url: str, params: Optional[dict] = None,
+             headers: Optional[dict] = None, tries: int = 3) -> Optional[httpx.Response]:
+        """GET with backoff on 429/5xx; None means the transport failed."""
+        for attempt in range(tries):
+            try:
+                r = self.http.get(url, params=params, headers=headers)
+            except httpx.HTTPError:
+                time.sleep(2 ** attempt)
+                continue
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < tries - 1:
+                time.sleep(_retry_after(r.headers.get("Retry-After"), 2 ** attempt))
+                continue
+            return r
+        return None
+
+    def _crossref_params(self, extra: Optional[dict] = None) -> dict:
+        p = {"mailto": self.mailto} if self.mailto else {}
+        p.update(extra or {})
+        return p
+
+    # ---- DOI ----
+
+    def lookup_doi(self, doi: str, check_updates: bool = True) -> tuple[str, dict]:
+        """Resolve one DOI → (status, metadata).
+
+        status: ``crossref`` | ``other-registry`` | ``not-found`` | ``error``.
+        """
+        r = self._get(f"{CROSSREF}/{quote(doi, safe='')}", self._crossref_params())
+        time.sleep(self.delay)
+        if r is None:
+            return "error", {"detail": "Crossref unreachable"}
+        if r.status_code == 200:
+            meta = parse_crossref(r.json().get("message", {}))
+            if check_updates:
+                meta["updates"] = _merge_updates(meta["updates"], self._notices_for(doi))
+            return "crossref", meta
+        if r.status_code != 404:
+            return "error", {"detail": f"Crossref HTTP {r.status_code}"}
+
+        # Not in Crossref: wrong DOI, or a DataCite / mEDRA / JaLC registration.
+        h = self._get(HANDLE + quote(doi, safe="/"))
+        if h is None:
+            return "error", {"detail": "doi.org handle server unreachable"}
+        if h.status_code != 200:
+            return "not-found", {}
+        c = self._get(DOI_RESOLVER + quote(doi, safe="/"),
+                      headers={"Accept": "application/vnd.citationstyles.csl+json"})
+        if c is not None and c.status_code == 200:
+            try:
+                return "other-registry", parse_csl(c.json())
+            except ValueError:
+                pass
+        return "other-registry", {"doi": doi}
+
+    def _notices_for(self, doi: str) -> list[dict]:
+        """Editorial notices (retraction, correction, …) that point at ``doi``."""
+        r = self._get(CROSSREF, self._crossref_params(
+            {"filter": f"updates:{doi}", "rows": 20,
+             "select": "DOI,type,update-to,title"}))
+        time.sleep(self.delay)
+        if r is None or r.status_code != 200:
+            return []
+        out = []
+        for item in r.json().get("message", {}).get("items", []):
+            for u in item.get("update-to") or []:
+                if clean_doi(u.get("DOI", "")).lower() == doi.lower():
+                    out.append({"type": (u.get("type") or "").lower(),
+                                "notice_doi": item.get("DOI", ""),
+                                "date": _date(u.get("updated")),
+                                "source": "crossref-notice"})
+        return out
+
+    def search_bibliographic(self, title: str, authors: str, year: str) -> list[dict]:
+        """Top Crossref matches for a citation that has no DOI."""
+        q = " ".join(x for x in (title, first_author_segment(authors), year) if x)
+        if len(norm_text(title)) < 15:
+            return []
+        r = self._get(CROSSREF, self._crossref_params(
+            {"query.bibliographic": q, "rows": 3,
+             "select": "DOI,title,author,issued,container-title,type"}))
+        time.sleep(self.delay)
+        if r is None or r.status_code != 200:
+            return []
+        cands = []
+        for item in r.json().get("message", {}).get("items", []):
+            m = parse_crossref(item)
+            cands.append({"doi": m["doi"], "title": m["title"], "year": m["year"],
+                          "first_author": m["authors"][0][0] if m["authors"] else "",
+                          "title_similarity": round(title_similarity(title, m["title"]), 3)})
+        return sorted(cands, key=lambda c: -c["title_similarity"])
+
+    # ---- PubMed ----
+
+    def lookup_pmids(self, pmids: list[str]) -> dict[str, Optional[dict]]:
+        """PMID → summary (None = not in PubMed); missing keys = lookup failed."""
+        out: dict[str, Optional[dict]] = {}
+        for i in range(0, len(pmids), 200):
+            batch = pmids[i:i + 200]
+            params = {"db": "pubmed", "id": ",".join(batch), "retmode": "json",
+                      "tool": "synthscholar-skill"}
+            if self.mailto:
+                params["email"] = self.mailto
+            if self.ncbi_key:
+                params["api_key"] = self.ncbi_key
+            r = self._get(ESUMMARY, params)
+            time.sleep(0.12 if self.ncbi_key else 0.4)
+            if r is None or r.status_code != 200:
+                continue
+            res = r.json().get("result", {})
+            for pmid in batch:
+                rec = res.get(pmid)
+                out[pmid] = None if (not rec or rec.get("error")) else parse_pubmed(rec)
+        return out
+
+    # ---- URLs ----
+
+    def check_url(self, url: str) -> tuple[bool, int]:
+        """Reachability. Falls back to GET: many servers reject HEAD."""
+        try:
+            r = self.http.head(url)
+            if r.status_code in (403, 405, 501):
+                with self.http.stream("GET", url) as s:
+                    return s.status_code < 400, s.status_code
+        except httpx.HTTPError:
+            return False, 0
+        return r.status_code < 400, r.status_code
+
+
+def _retry_after(value: Optional[str], default: float) -> float:
+    if not value:
+        return default
+    try:
+        return min(float(value), 60.0)
+    except ValueError:
+        try:
+            return max(0.0, min(parsedate_to_datetime(value).timestamp() - time.time(), 60.0))
+        except (TypeError, ValueError):
+            return default
+
+
+def _date(d: Optional[dict]) -> str:
+    parts = ((d or {}).get("date-parts") or [[]])[0]
+    return "-".join(f"{p:02d}" if i else str(p) for i, p in enumerate(parts) if p)
+
+
+def _years(msg: dict, keys: Iterable[str]) -> list[int]:
+    ys = []
+    for k in keys:
+        parts = ((msg.get(k) or {}).get("date-parts") or [[]])[0]
+        if parts and parts[0]:
+            ys.append(int(parts[0]))
+    return ys
+
+
+def _merge_updates(*lists: list[dict]) -> list[dict]:
+    seen, out = set(), []
+    for u in (x for lst in lists for x in lst):
+        key = (u.get("type"), (u.get("notice_doi") or "").lower())
+        if key not in seen:
+            seen.add(key)
+            out.append(u)
+    return out
+
+
+def _first(v: Any) -> str:
+    if isinstance(v, list):
+        return str(v[0]) if v else ""
+    return str(v or "")
+
+
+def parse_crossref(msg: dict) -> dict:
+    years = _years(msg, ("issued", "published", "published-print",
+                         "published-online", "posted"))
+    if not years:
+        years = _years(msg, ("created",))
+    rel = msg.get("relation") or {}
+    return {
+        "registry": "crossref",
+        "doi": msg.get("DOI", ""),
+        "title": html.unescape(re.sub(r"<[^>]+>", "", _first(msg.get("title")))).strip(),
+        "authors": [(a.get("family") or a.get("name") or "", a.get("given") or "")
+                    for a in msg.get("author") or []],
+        "year": min(years) if years else None,
+        "years": sorted(set(years)),
+        "journal": _first(msg.get("container-title")),
+        "journal_abbrev": _first(msg.get("short-container-title")),
+        "volume": msg.get("volume", ""),
+        "issue": msg.get("issue", ""),
+        "pages": msg.get("page", "") or msg.get("article-number", ""),
+        "type": msg.get("type", ""),
+        "publisher": msg.get("publisher", ""),
+        # This record is itself a notice when it updates something else.
+        "notice_for": [{"type": (u.get("type") or "").lower(), "doi": u.get("DOI", "")}
+                       for u in msg.get("update-to") or []],
+        "updates": [{"type": (u.get("type") or "").lower(),
+                     "notice_doi": u.get("DOI", ""), "date": _date(u.get("updated")),
+                     "source": u.get("source", "crossref")}
+                    for u in msg.get("updated-by") or []],
+        "published_as": [r.get("id", "") for r in rel.get("is-preprint-of") or []],
+    }
+
+
+def parse_csl(csl: dict) -> dict:
+    years = _years(csl, ("issued", "published-print", "published-online"))
+    return {
+        "registry": "other",
+        "doi": csl.get("DOI", ""),
+        "title": _first(csl.get("title")).strip(),
+        "authors": [(a.get("family") or a.get("literal") or "", a.get("given") or "")
+                    for a in csl.get("author") or []],
+        "year": min(years) if years else None,
+        "years": sorted(set(years)),
+        "journal": _first(csl.get("container-title")) or csl.get("publisher", ""),
+        "journal_abbrev": _first(csl.get("container-title-short")),
+        "volume": str(csl.get("volume", "") or ""),
+        "issue": str(csl.get("issue", "") or ""),
+        "pages": str(csl.get("page", "") or ""),
+        "type": csl.get("type", ""),
+        "publisher": csl.get("publisher", ""),
+        "notice_for": [], "updates": [], "published_as": [],
+    }
+
+
+def parse_pubmed(rec: dict) -> dict:
+    doi = next((i.get("value", "") for i in rec.get("articleids", [])
+                if i.get("idtype") == "doi"), "")
+    return {
+        "title": html.unescape(rec.get("title", "")).rstrip("."),
+        "year": first_year(rec.get("pubdate", "") or rec.get("sortpubdate", "")),
+        "first_author": (rec.get("authors") or [{}])[0].get("name", ""),
+        "journal": rec.get("fulljournalname", "") or rec.get("source", ""),
+        "doi": doi,
+        "retracted": "Retracted Publication" in (rec.get("pubtype") or []),
+    }
+
+
+# ─────────────────────────── findings ────────────────────────────
+
+def finding(code: str, severity: str, message: str, **extra: Any) -> dict:
+    return {"code": code, "severity": severity, "message": message, **extra}
+
+
+def worst(findings: list[dict]) -> str:
+    if not findings:
+        return "verified"
+    top = max(SEVERITY_RANK[f["severity"]] for f in findings)
+    return {0: "verified", 1: "warnings", 2: "failed"}[top]
+
+
+def check_registry_record(claimed: dict, meta: dict, line_mode: bool = False) -> list[dict]:
+    """Compare what the review claims with a registry record."""
+    out: list[dict] = []
+    reg_title = meta.get("title", "")
+    if reg_title:
+        sim = (title_in_line(reg_title, claimed["title"]) if line_mode
+               else title_similarity(claimed["title"], reg_title))
+        meta["title_similarity"] = round(sim, 3)
+        if not claimed["title"]:
+            pass
+        elif sim < TITLE_PARTIAL:
+            out.append(finding("doi-title-mismatch", "error",
+                               f"DOI is registered to a different paper: “{reg_title}”"))
+        elif sim < TITLE_MATCH:
+            out.append(finding("doi-title-partial", "warning",
+                               f"Title only partly matches the registered “{reg_title}” "
+                               f"(similarity {sim:.2f})"))
+    title_ok = meta.get("title_similarity", 0) >= TITLE_MATCH
+
+    if meta.get("authors") and claimed["authors"] and not line_mode:
+        fam = meta["authors"][0][0]
+        if fam and not surname_matches(fam, claimed["authors"]):
+            out.append(finding("doi-author-mismatch", "warning",
+                               f"Registered first author is {fam}, review has "
+                               f"“{first_author_segment(claimed['authors']).strip()}”"))
+
+    cy = first_year(claimed["year"])
+    if cy and meta.get("years") and not line_mode:
+        gap = min(abs(cy - y) for y in meta["years"])
+        if gap > 1:
+            out.append(finding("doi-year-mismatch", "warning",
+                               f"Review says {cy}; registered {'/'.join(map(str, meta['years']))}"))
+        elif gap == 1:
+            out.append(finding("doi-year-offby1", "info",
+                               f"Review says {cy}; registered {'/'.join(map(str, meta['years']))} "
+                               "(online vs print date)"))
+
+    for u in meta.get("updates", []):
+        t = u.get("type", "")
+        sev = "error" if t in UPDATE_ERROR else "warning" if t in UPDATE_WARNING else "info"
+        out.append(finding("retracted" if sev == "error" else f"update-{t or 'notice'}", sev,
+                           f"{t.replace('_', ' ').capitalize() or 'Update'} notice"
+                           + (f" {u['notice_doi']}" if u.get("notice_doi") else "")
+                           + (f" ({u['date']})" if u.get("date") else "")))
+    for n in meta.get("notice_for", []):
+        sev = "error" if n["type"] in UPDATE_ERROR else "warning"
+        out.append(finding("cites-notice", sev,
+                           f"This DOI is a {n['type'] or 'notice'} for {n['doi']}, not a study"))
+    if meta.get("published_as") and title_ok:
+        out.append(finding("preprint-published", "info",
+                           "Preprint; published version: " + ", ".join(meta["published_as"])))
+    return out
+
+
+def check_pubmed_record(claimed: dict, pm: dict) -> list[dict]:
+    out: list[dict] = []
+    sim = title_similarity(claimed["title"], pm["title"]) if claimed["title"] else 1.0
+    pm["title_similarity"] = round(sim, 3)
+    if sim < TITLE_PARTIAL:
+        out.append(finding("pmid-title-mismatch", "error",
+                           f"PMID belongs to a different paper: “{pm['title']}”"))
+    elif sim < TITLE_MATCH:
+        out.append(finding("pmid-title-partial", "warning",
+                           f"Title only partly matches PubMed's “{pm['title']}” ({sim:.2f})"))
+    cdoi = clean_doi(claimed["doi"]).lower()
+    if cdoi and pm["doi"] and cdoi != pm["doi"].lower():
+        out.append(finding("pmid-doi-conflict", "error",
+                           f"PubMed lists DOI {pm['doi']} for this PMID, review has {claimed['doi']}"))
+    if pm["retracted"]:
+        out.append(finding("retracted", "error", "PubMed marks this a Retracted Publication"))
+    return out
+
+
+# ─────────────────────────── in-text citations ────────────────────────────
+
+def walk_prose(node: Any, path: str = "") -> Iterable[tuple[str, str, Any]]:
+    """Yield (path, key, value) for every leaf of the generated review."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if not path and k in NON_PROSE:
+                continue
+            yield from walk_prose(v, f"{path}.{k}" if path else k)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from walk_prose(v, f"{path}[{i}]")
+    else:
+        yield path, path.rsplit(".", 1)[-1].split("[")[0], node
+
+
+def snippet(text: str, start: int, end: int, pad: int = 60) -> str:
+    s = text[max(0, start - pad):end + pad].replace("\n", " ")
+    return ("…" if start > pad else "") + s.strip() + ("…" if end + pad < len(text) else "")
+
+
+def extract_citations(text: str) -> list[dict]:
+    """PMID, DOI and author–year citations in one piece of prose, with pairing.
+
+    Inside a parenthetical, "(Smith et al., 2023; PMID: 123)" pairs the author–
+    year with the PMID that follows it, so a mislabelled pair can be caught.
+    """
+    cites: list[dict] = []
+    for m in PMID_RE.finditer(text):
+        for pid in PMID_ID.findall(m.group(1)):
+            cites.append({"kind": "pmid", "id": pid.lower(), "pos": m.start(),
+                          "snippet": snippet(text, m.start(), m.end())})
+    for m in DOI_RE.finditer(text):
+        cites.append({"kind": "doi", "id": _trim(m.group()).lower(), "pos": m.start(),
+                      "snippet": snippet(text, m.start(), m.end())})
+    for m in AUTHOR_YEAR_RE.finditer(text):
+        # Only inside a parenthetical or directly followed by one: "Smith (2023)"
+        # matches through the narrative form below, plain prose like "In March 2020"
+        # is excluded because "March" is not followed by a citation context.
+        if not _in_citation_context(text, m) or m.group(1).lower() in NOT_SURNAMES:
+            continue
+        cites.append({"kind": "author_year", "surname": m.group(1), "year": m.group(2),
+                      "pos": m.start(), "snippet": snippet(text, m.start(), m.end())})
+    for m in re.finditer(rf"({SURNAME})(?:\s+et\s+al\.?|\s+(?:and|&)\s+{SURNAME})?\s+\(((?:19|20)\d\d)[a-z]?\)", text):
+        if m.group(1).lower() in NOT_SURNAMES:
+            continue
+        cites.append({"kind": "author_year", "surname": m.group(1), "year": m.group(2),
+                      "pos": m.start(), "snippet": snippet(text, m.start(), m.end())})
+
+    # Pair author–year with the PMID that follows it in the same parenthetical.
+    for pm in PAREN_RE.finditer(text):
+        segs = [s.strip() for s in pm.group(1).split(";")]
+        last_ay = None
+        for seg in segs:
+            ay = AUTHOR_YEAR_RE.search(seg)
+            pm_m = PMID_RE.search(seg)
+            ids = PMID_ID.findall(pm_m.group(1)) if pm_m else []
+            if ay and ay.group(1).lower() not in NOT_SURNAMES:
+                last_ay = (ay.group(1), ay.group(2))
+            if ids and last_ay:
+                for pid in ids:
+                    cites.append({"kind": "pair", "id": pid.lower(), "surname": last_ay[0],
+                                  "year": last_ay[1], "pos": pm.start(),
+                                  "snippet": snippet(text, pm.start(), pm.end())})
+                last_ay = None
+    return cites
+
+
+def _in_citation_context(text: str, m: re.Match) -> bool:
+    """True when an author–year match sits inside parentheses."""
+    before = text[:m.start()]
+    return before.rfind("(") > before.rfind(")")
+
+
+# ─────────────────────────── driver ────────────────────────────
+
+class Verifier:
+    def __init__(self, registry: Optional[Registry], check_updates: bool = True,
+                 search_missing: bool = True):
+        self.reg = registry
+        self.check_updates = check_updates
+        self.search_missing = search_missing
+
+    # ---- review JSON ----
+
+    def verify_review(self, review: dict) -> dict:
+        arts = review.get("included_articles") or []
+        refs = [self._claimed(a) for a in arts]
+        report: dict = {"mode": "review", "references": [], "in_text": [],
+                        "review_findings": [], "urls": {}}
+
+        # Duplicates across included articles.
+        seen: dict[str, str] = {}
+        for c in refs:
+            d = clean_doi(c["doi"]).lower()
+            if d and d in seen:
+                report["review_findings"].append(finding(
+                    "duplicate-doi", "warning",
+                    f"{c['key']} and {seen[d]} share DOI {d} — the same study included twice?"))
+            elif d:
+                seen[d] = c["key"]
+
+        pubmed = {}
+        if self.reg:
+            real = [c["pmid"] for c in refs if REAL_PMID.match(c["pmid"])]
+            if real:
+                print(f"PubMed: {len(real)} PMID(s)…", file=sys.stderr)
+                pubmed = self.reg.lookup_pmids(real)
+
+        for n, c in enumerate(refs, 1):
+            rec = self._verify_reference(c, pubmed)
+            report["references"].append(rec)
+            print(f"[{n:>3}/{len(refs)}] {rec['status']:>9}  {c['key']}"
+                  + (f"  {rec['doi']}" if rec["doi"] else ""), file=sys.stderr)
+
+        self._verify_in_text(review, refs, report)
+        report["grounding_validation"] = _grounding_summary(review.get("grounding_validation"))
+        return report
+
+    @staticmethod
+    def _claimed(a: dict) -> dict:
+        pmid = str(a.get("pmid") or "").strip()
+        return {"key": pmid or clean_doi(a.get("doi", "")) or a.get("title", "")[:40],
+                "pmid": pmid, "doi": str(a.get("doi") or ""),
+                "title": a.get("title") or "", "authors": a.get("authors") or "",
+                "year": str(a.get("year") or ""), "journal": a.get("journal") or ""}
+
+    def _verify_reference(self, c: dict, pubmed: dict) -> dict:
+        findings: list[dict] = []
+        rec: dict = {"key": c["key"], "pmid": c["pmid"], "doi": "", "claimed": c,
+                     "registry": None, "pubmed": None, "candidates": [], "suggested": {}}
+
+        raw = c["doi"].strip()
+        doi = clean_doi(raw)
+        if raw and doi != raw:
+            findings.append(finding("doi-malformed", "warning",
+                                    f"DOI field holds “{raw}”; the bare form is {doi}"))
+            rec["suggested"]["doi"] = doi
+        if doi and not DOI_FORM.match(doi):
+            findings.append(finding("doi-invalid", "error", f"“{doi}” is not a DOI"))
+            doi = ""
+        rec["doi"] = doi
+
+        if self.reg is None:
+            rec["findings"] = findings
+            rec["status"] = "offline" if not findings else worst(findings)
+            return rec
+
+        # PubMed side.
+        if REAL_PMID.match(c["pmid"]):
+            if c["pmid"] not in pubmed:
+                findings.append(finding("lookup-failed", "warning", "PubMed lookup failed"))
+            elif pubmed[c["pmid"]] is None:
+                findings.append(finding("pmid-not-found", "error",
+                                        f"PMID {c['pmid']} is not in PubMed"))
+            else:
+                pm = pubmed[c["pmid"]]
+                rec["pubmed"] = pm
+                findings += check_pubmed_record(c, pm)
+                if not doi and pm["doi"] and pm["title_similarity"] >= TITLE_MATCH:
+                    rec["suggested"]["doi"] = pm["doi"]
+                    findings.append(finding("doi-from-pubmed", "info",
+                                            f"No DOI in the review; PubMed has {pm['doi']}"))
+                    doi = pm["doi"]
+                    rec["doi"] = doi
+
+        # DOI side.
+        if doi:
+            status, meta = self.reg.lookup_doi(doi, self.check_updates)
+            if status == "error":
+                findings.append(finding("lookup-failed", "warning",
+                                        f"DOI lookup failed: {meta.get('detail', '')}"))
+            elif status == "not-found":
+                findings.append(finding("doi-not-found", "error",
+                                        f"{doi} is not registered with any DOI agency"))
+            else:
+                rec["registry"] = meta
+                findings += check_registry_record(c, meta)
+                if meta.get("title_similarity", 0) >= TITLE_MATCH or (not c["title"] and meta.get("title")):
+                    rec["suggested"].update(_fill_empty(c, meta))
+        elif not c["pmid"] or not REAL_PMID.match(c["pmid"]) or rec["pubmed"] is None:
+            findings.append(finding("doi-missing", "warning",
+                                    "No DOI or PMID to verify this reference against"))
+
+        if (not doi or any(f["code"] == "doi-title-mismatch" for f in findings)) \
+                and self.search_missing and c["title"]:
+            cands = [x for x in self.reg.search_bibliographic(c["title"], c["authors"], c["year"])
+                     if x["title_similarity"] >= TITLE_MATCH and x["doi"].lower() != doi.lower()]
+            rec["candidates"] = cands
+            if cands:
+                findings.append(finding("doi-candidate", "info",
+                                        f"Crossref match by title: {cands[0]['doi']} "
+                                        f"(similarity {cands[0]['title_similarity']:.2f}) — confirm before using"))
+
+        rec["findings"] = findings
+        rec["status"] = worst(findings)
+        return rec
+
+    def _verify_in_text(self, review: dict, refs: list[dict], report: dict) -> None:
+        by_pmid = {c["pmid"].lower(): c for c in refs if c["pmid"]}
+        by_doi = {clean_doi(c["doi"]).lower(): c for c in refs if c["doi"]}
+        for r in report["references"]:  # DOIs learned from PubMed count too
+            if r["doi"]:
+                by_doi.setdefault(r["doi"].lower(), r["claimed"])
+        screened = {str(e.get("pmid", "")).lower(): e for e in review.get("screening_log") or []}
+        cited: set[str] = set()
+
+        for path, key, value in walk_prose(review):
+            if (key in STRUCTURED_ID_KEYS or key.endswith("_pmids")) and isinstance(value, (str, int)):
+                ids = [str(value).lower()]
+                cites = [{"kind": "pmid", "id": i, "snippet": f"{key} = {value}"} for i in ids if i]
+            elif isinstance(value, str) and len(value) > 3:
+                cites = extract_citations(value)
+            else:
+                continue
+            for ct in cites:
+                f = self._judge_citation(ct, by_pmid, by_doi, refs, screened, cited)
+                if f:
+                    report["in_text"].append({**f, "location": path, "snippet": ct["snippet"]})
+
+        for c in refs:
+            if c["key"].lower() not in cited:
+                report["review_findings"].append(finding(
+                    "uncited-included", "info",
+                    f"{c['key']} ({first_author_segment(c['authors']).strip()} {c['year']}) is "
+                    "included but never cited in the generated text"))
+
+    @staticmethod
+    def _judge_citation(ct: dict, by_pmid: dict, by_doi: dict, refs: list[dict],
+                        screened: dict, cited: set) -> Optional[dict]:
+        kind = ct["kind"]
+        if kind in ("pmid", "doi"):
+            hit = (by_pmid if kind == "pmid" else by_doi).get(ct["id"])
+            if hit:
+                cited.add(hit["key"].lower())
+                return None
+            label = f"{'PMID' if kind == 'pmid' else 'DOI'} {ct['id']}"
+            log = screened.get(ct["id"]) if kind == "pmid" else None
+            if log:
+                return finding("citation-excluded", "error",
+                               f"{label} is cited but was excluded at {log.get('stage', '?')}"
+                               + (f": {log['reason']}" if log.get("reason") else ""))
+            return finding("citation-unknown", "error",
+                           f"{label} is cited but appears nowhere in the review — not "
+                           "included, not screened (hallucinated or from another review)")
+        if kind == "author_year":
+            hits = [c for c in refs if surname_matches(ct["surname"], c["authors"])
+                    and years_close(c["year"], ct["year"])]
+            if hits:
+                for h in hits:
+                    cited.add(h["key"].lower())
+                return None
+            return finding("author-year-unmatched", "warning",
+                           f"“{ct['surname']} {ct['year']}” matches no included study")
+        if kind == "pair":
+            c = by_pmid.get(ct["id"])
+            if c and not (surname_matches(ct["surname"], c["authors"])
+                          and years_close(c["year"], ct["year"])):
+                return finding("author-year-pmid-conflict", "warning",
+                               f"“{ct['surname']} {ct['year']}” is paired with PMID {ct['id']}, "
+                               f"which is {first_author_segment(c['authors']).strip()} {c['year']}")
+        return None
+
+    # ---- generic Markdown ----
+
+    def verify_markdown(self, text: str) -> dict:
+        report: dict = {"mode": "markdown", "references": [], "in_text": [],
+                        "review_findings": [], "urls": {}}
+        m = re.search(r"^#{1,3}\s*(?:\d+\.?\s*)?(References|Bibliography)\s*$", text,
+                      re.MULTILINE | re.IGNORECASE)
+        body, refs_text = (text[:m.start()], text[m.end():]) if m else (text, "")
+        # The next top-level heading (an appendix) ends the reference list.
+        ref_block = refs_text.splitlines()
+        end = next((i for i, ln in enumerate(ref_block) if ln.startswith("## ")), len(ref_block))
+        ref_lines = [ln.strip() for ln in ref_block[:end] if ln.strip()]
+
+        lines_by_doi = {}
+        for ln in ref_lines:
+            for d in DOI_RE.findall(ln):
+                lines_by_doi.setdefault(_trim(d).lower(), ln)
+        all_dois = []
+        for d in DOI_RE.findall(text):
+            d = _trim(d)
+            if d.lower() not in {x.lower() for x in all_dois}:
+                all_dois.append(d)
+
+        for n, doi in enumerate(all_dois, 1):
+            line = lines_by_doi.get(doi.lower(), "")
+            claimed = {"key": doi, "pmid": "", "doi": doi, "title": line,
+                       "authors": "", "year": "", "journal": ""}
+            findings: list[dict] = []
+            rec = {"key": doi, "pmid": "", "doi": doi, "claimed": claimed, "registry": None,
+                   "pubmed": None, "candidates": [], "suggested": {}}
+            if self.reg:
+                status, meta = self.reg.lookup_doi(doi, self.check_updates)
+                if status == "error":
+                    findings.append(finding("lookup-failed", "warning", meta.get("detail", "")))
+                elif status == "not-found":
+                    findings.append(finding("doi-not-found", "error",
+                                            f"{doi} is not registered with any DOI agency"))
+                else:
+                    rec["registry"] = meta
+                    findings += check_registry_record(claimed, meta, line_mode=bool(line))
+            rec["findings"] = findings
+            rec["status"] = worst(findings) if self.reg else "offline"
+            report["references"].append(rec)
+            print(f"[{n:>3}/{len(all_dois)}] {rec['status']:>9}  {doi}", file=sys.stderr)
+
+        if ref_lines:
+            for ct in extract_citations(body):
+                if ct["kind"] != "author_year":
+                    continue
+                ok = any(surname_matches(ct["surname"], ln.split("(")[0]) or
+                         (norm_text(ct["surname"]) in norm_text(ln[:120]).split())
+                         for ln in ref_lines if ct["year"] in ln)
+                if not ok:
+                    report["in_text"].append({**finding(
+                        "author-year-unmatched", "warning",
+                        f"“{ct['surname']} {ct['year']}” matches no reference-list entry"),
+                        "location": "body", "snippet": ct["snippet"]})
+        return report
+
+
+def _fill_empty(c: dict, meta: dict) -> dict:
+    """Fields the review left empty that a matching registry record supplies."""
+    s: dict = {}
+    if not c["title"] and meta.get("title"):
+        s["title"] = meta["title"]
+    if not first_year(c["year"]) and meta.get("year"):
+        s["year"] = str(meta["year"])
+    if not c["journal"] and meta.get("journal"):
+        s["journal"] = meta["journal"]
+    if not c["authors"].strip() and meta.get("authors"):
+        s["authors"] = ", ".join(f"{f} {_initials(g, '')}".strip() for f, g in meta["authors"])
+    return s
+
+
+def _grounding_summary(g: Optional[dict]) -> Optional[dict]:
+    if not g:
+        return None
+    return {k: g.get(k) for k in ("overall_verdict", "hallucinated_citation_count",
+                                  "unresolved_citations")}
+
+
+def summarise(report: dict) -> dict:
+    refs = report["references"]
+    allf = [f for r in refs for f in r.get("findings", [])] + report["in_text"] + report["review_findings"]
+    count = lambda sev: sum(f["severity"] == sev for f in allf)
+    by_code: dict[str, int] = {}
+    for f in allf:
+        by_code[f["code"]] = by_code.get(f["code"], 0) + 1
+    statuses: dict[str, int] = {}
+    for r in refs:
+        statuses[r["status"]] = statuses.get(r["status"], 0) + 1
+    return {
+        "references": len(refs),
+        "reference_status": statuses,
+        "errors": count("error"), "warnings": count("warning"), "info": count("info"),
+        "by_code": dict(sorted(by_code.items())),
+        "retracted": sorted(r["key"] for r in refs
+                            if any(f["code"] == "retracted" for f in r.get("findings", []))),
+        "dead_urls": sorted(u for u, v in report["urls"].items() if not v["accessible"]),
+    }
+
+
+# ─────────────────────────── reference styles ────────────────────────────
+# Rendered from registry metadata where the record matched, per
+# references/citation_styles.md; unverified entries keep the review's text.
+
+def _initials(given: str, sep: str = ".") -> str:
+    parts = []
+    for tok in (given or "").replace(".", " ").split():
+        sub = [p[0].upper() + sep for p in tok.split("-") if p]
+        parts.append("-".join(sub))
+    return (" " if sep else "").join(parts)
+
+
+def _authors_style(authors: list[tuple[str, str]], style: str) -> str:
+    if style == "apa":
+        names = [f"{f}, {_initials(g)}".rstrip(", ") for f, g in authors]
+        if len(names) > 20:
+            names = names[:19] + ["…", names[-1]]
+            return ", ".join(names[:-1]) + " " + names[-1]
+        return names[0] if len(names) == 1 else ", ".join(names[:-1]) + ", & " + names[-1]
+    if style == "nature":
+        names = [f"{f}, {_initials(g)}".rstrip(", ") for f, g in authors]
+        if len(names) > 5:
+            return names[0] + " et al."
+        return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " & " + names[-1]
+    if style == "vancouver":
+        names = [f"{f} {_initials(g, '').replace(' ', '')}".strip() for f, g in authors]
+        return ", ".join(names[:6]) + (", et al." if len(names) > 6 else "")
+    if style == "ieee":
+        names = [f"{_initials(g)} {f}".strip() for f, g in authors]
+        if len(names) > 6:
+            return names[0] + " et al."
+        return names[0] if len(names) == 1 else ", ".join(names[:-1]) + ", and " + names[-1]
+    raise ValueError(style)
+
+
+def render_reference(rec: dict, style: str) -> str:
+    m = rec.get("registry") or {}
+    trusted = m and m.get("title_similarity", 0) >= TITLE_MATCH and m.get("authors")
+    c = rec["claimed"]
+    if not trusted:
+        doi = f" https://doi.org/{rec['doi']}" if rec["doi"] else ""
+        return f"{c['authors']} ({c['year'] or 'n.d.'}). {c['title']}. *{c['journal']}*.{doi} [unverified]"
+    a = _authors_style(m["authors"], style)
+    t, y = m["title"].rstrip("."), m.get("year") or "n.d."
+    j = m["journal"]
+    jab = m.get("journal_abbrev") or j
+    v, i, p, d = m.get("volume", ""), m.get("issue", ""), m.get("pages", ""), m["doi"]
+    if style == "apa":
+        s = f"{a} ({y}). {t}."
+        if j:
+            s += f" *{j}*"
+            s += f", *{v}*" if v else ""
+            s += f"({i})" if i else ""
+            s += f", {p}" if p else ""
+            s += "."
+        return s + f" https://doi.org/{d}"
+    if style == "nature":
+        s = f"{a} {t}. *{jab}*" + (f" **{v}**," if v else "") + (f" {p}" if p else "")
+        return s + f" ({y}). https://doi.org/{d}"
+    if style == "vancouver":
+        s = f"{a}. {t}. {jab.replace('.', '')}. {y}"
+        s += f";{v}" if v else ""
+        s += f"({i})" if i else ""
+        s += f":{p}" if p else ""
+        return s + f". doi:{d}"
+    s = f"{a}, “{t},” *{jab}*"
+    s += f", vol. {v}" if v else ""
+    s += f", no. {i}" if i else ""
+    s += f", pp. {p}" if p else ""
+    return s + f", {y}, doi: {d}."
+
+
+def render_reference_list(report: dict, style: str, order: list[str]) -> str:
+    recs = {r["key"]: r for r in report["references"]}
+    keyed = [recs[k] for k in order if k in recs] + [r for r in report["references"] if r["key"] not in order]
+    if style == "apa":
+        keyed.sort(key=lambda r: norm_text(
+            (r.get("registry") or {}).get("authors", [("", "")])[0][0]
+            if (r.get("registry") or {}).get("authors") else r["claimed"]["authors"]))
+        lines = [render_reference(r, style) for r in keyed]
+    else:
+        lines = [f"{n}. {render_reference(r, style)}" if style != "ieee"
+                 else f"[{n}] {render_reference(r, style)}" for n, r in enumerate(keyed, 1)]
+    return f"## References ({style})\n\n" + "\n\n".join(lines) + "\n"
+
+
+def citation_order(review: dict, refs: list[dict]) -> list[str]:
+    """Included-article keys in order of first citation, uncited ones last."""
+    by_pmid = {r["pmid"].lower(): r["key"] for r in refs if r["pmid"]}
+    order: list[str] = []
+    for _, _, value in walk_prose(review):
+        if isinstance(value, str):
+            for ct in sorted(extract_citations(value), key=lambda x: x["pos"]):
+                k = by_pmid.get(ct.get("id", ""))
+                if k and k not in order:
+                    order.append(k)
+    return order
+
+
+# ─────────────────────────── report output ────────────────────────────
+
+def render_markdown(report: dict, source: str) -> str:
+    s = report["summary"]
+    out = [f"# Citation verification — {Path(source).name}\n"]
+    out.append(f"**{s['errors']} error(s), {s['warnings']} warning(s), {s['info']} note(s)** "
+               f"across {s['references']} reference(s).  ")
+    out.append("Reference status: " + ", ".join(f"{k} {v}" for k, v in sorted(s["reference_status"].items())) + "\n")
+    if s["retracted"]:
+        out.append(f"**Retracted:** {', '.join(s['retracted'])}\n")
+    g = report.get("grounding_validation")
+    if g:
+        out.append(f"LLM grounding pass for comparison: verdict {g.get('overall_verdict')}, "
+                   f"{g.get('hallucinated_citation_count')} hallucinated citation(s).\n")
+
+    def table(rows: list[tuple]) -> list[str]:
+        t = ["| Severity | Item | Finding |", "| --- | --- | --- |"]
+        t += [f"| {sev} | {item} | {msg.replace('|', '/')} |" for sev, item, msg in rows]
+        return t + [""]
+
+    rank = lambda f: -SEVERITY_RANK[f["severity"]]
+    ref_rows = [(f["severity"], f"`{r['key']}`", f["message"])
+                for r in report["references"] for f in sorted(r["findings"], key=rank)
+                if f["severity"] != "info"]
+    if ref_rows:
+        out += ["## Reference metadata\n"] + table(ref_rows)
+    txt_rows = [(f["severity"], f"`{f['location']}`", f"{f['message']}<br>…{f['snippet']}")
+                for f in sorted(report["in_text"], key=rank)]
+    if txt_rows:
+        out += ["## In-text citations\n"] + table(txt_rows)
+    rev_rows = [(f["severity"], "review", f["message"])
+                for f in sorted(report["review_findings"], key=rank) if f["severity"] != "info"]
+    if rev_rows:
+        out += ["## Review-level\n"] + table(rev_rows)
+    info = [(f["severity"], f"`{r['key']}`", f["message"])
+            for r in report["references"] for f in r["findings"] if f["severity"] == "info"]
+    info += [("info", "review", f["message"]) for f in report["review_findings"] if f["severity"] == "info"]
+    if info:
+        out += ["<details><summary>Notes ({})</summary>\n".format(len(info))] + table(info) + ["</details>\n"]
+    if s["dead_urls"]:
+        out += ["## Unreachable URLs\n"] + [f"- {u}" for u in s["dead_urls"]] + [""]
+    if not (ref_rows or txt_rows or rev_rows):
+        out.append("No errors or warnings.\n")
+    return "\n".join(out)
+
+
+def apply_fixes(review: dict, report: dict) -> list[dict]:
+    """Write registry-confirmed corrections into ``review`` in place."""
+    recs = {r["key"]: r for r in report["references"]}
+    applied = []
+    for a in review.get("included_articles") or []:
+        rec = recs.get(Verifier._claimed(a)["key"])
+        if not rec:
+            continue
+        for field, value in rec["suggested"].items():
+            if str(a.get(field) or "") != value:
+                applied.append({"key": rec["key"], "field": field,
+                                "old": a.get(field, ""), "new": value})
+                a[field] = value
+    return applied
+
+
+# ─────────────────────────── CLI ────────────────────────────
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("input", help="review JSON (PRISMAReviewResult) or a Markdown file")
+    ap.add_argument("--outdir", help="report directory (default: next to the input)")
+    ap.add_argument("--mailto", default=(os.environ.get("SYNTHSCHOLAR_EMAIL")
+                                         or os.environ.get("NCBI_EMAIL") or ""),
+                    help="contact address for Crossref's polite pool and NCBI")
+    ap.add_argument("--offline", action="store_true",
+                    help="no network: DOI syntax and in-text citations only")
+    ap.add_argument("--no-retraction-check", action="store_true",
+                    help="skip the per-DOI Crossref notice query (halves requests)")
+    ap.add_argument("--no-search", action="store_true",
+                    help="don't search Crossref for DOI candidates of DOI-less references")
+    ap.add_argument("--check-urls", action="store_true", help="also test non-DOI URLs")
+    ap.add_argument("--style", choices=["apa", "nature", "vancouver", "ieee"],
+                    help="also write a reference list in this style from verified metadata")
+    ap.add_argument("--apply", metavar="OUT_JSON",
+                    help="write a copy of the review with registry-confirmed fixes")
+    ap.add_argument("--strict", action="store_true", help="warnings also fail the exit code")
+    ap.add_argument("--delay", type=float, default=0.2, help="seconds between Crossref calls")
+    args = ap.parse_args()
+
+    src = Path(args.input)
+    if not src.is_file():
+        print(f"no such file: {src}", file=sys.stderr)
+        return 2
+    text = src.read_text(encoding="utf-8")
+    is_json = src.suffix.lower() == ".json"
+    review: dict = {}
+    if is_json:
+        try:
+            review = json.loads(text)
+        except json.JSONDecodeError as e:
+            print(f"{src}: not valid JSON ({e})", file=sys.stderr)
+            return 2
+        if not isinstance(review, dict) or "included_articles" not in review:
+            print(f"{src}: not a review result (no included_articles)", file=sys.stderr)
+            return 2
+    if (args.apply or args.style) and not is_json:
+        print("--apply and --style need the review JSON", file=sys.stderr)
+        return 2
+
+    reg = None if args.offline else Registry(mailto=args.mailto, delay=args.delay)
+    if reg and not args.mailto:
+        print("note: no --mailto / SYNTHSCHOLAR_EMAIL — using Crossref's public pool (slower)",
+              file=sys.stderr)
+    v = Verifier(reg, check_updates=not args.no_retraction_check,
+                 search_missing=not args.no_search)
+    try:
+        report = v.verify_review(review) if is_json else v.verify_markdown(text)
+        if args.check_urls and reg:
+            prose = (" ".join(str(x[2]) for x in walk_prose(review) if isinstance(x[2], str))
+                     if is_json else text)
+            urls = list(dict.fromkeys(u.rstrip(TRAILING) for u in URL_RE.findall(prose)
+                                      if "doi.org" not in u))
+            for u in urls:
+                ok, code = reg.check_url(u)
+                report["urls"][u] = {"accessible": ok, "status_code": code}
+                print(f"[{'ok' if ok else 'dead':>9}] {code} {u}", file=sys.stderr)
+    finally:
+        if reg:
+            reg.close()
+
+    report = {"file": str(src), "offline": args.offline, **report}
+    report["summary"] = summarise(report)
+
+    outdir = Path(args.outdir) if args.outdir else src.parent
+    outdir.mkdir(parents=True, exist_ok=True)
+    base = outdir / src.stem
+    if args.apply:
+        report["applied"] = apply_fixes(review, report)
+        Path(args.apply).write_text(json.dumps(review, indent=2, ensure_ascii=False),
+                                    encoding="utf-8")
+        print(f"applied {len(report['applied'])} fix(es) → {args.apply}", file=sys.stderr)
+    if args.style:
+        refs = [r["claimed"] for r in report["references"]]
+        ref_md = render_reference_list(report, args.style, citation_order(review, refs))
+        Path(f"{base}.references.{args.style}.md").write_text(ref_md, encoding="utf-8")
+    Path(f"{base}.citations.json").write_text(json.dumps(report, indent=2, ensure_ascii=False),
+                                              encoding="utf-8")
+    Path(f"{base}.citations.md").write_text(render_markdown(report, str(src)), encoding="utf-8")
+
+    s = report["summary"]
+    print(f"\n{s['references']} reference(s): "
+          + ", ".join(f"{k} {n}" for k, n in sorted(s["reference_status"].items()))
+          + f" | {s['errors']} error(s), {s['warnings']} warning(s)", file=sys.stderr)
+    for code, n in s["by_code"].items():
+        print(f"  {code}: {n}", file=sys.stderr)
+    print(f"report: {base}.citations.md  ({base}.citations.json)", file=sys.stderr)
+    if args.style:
+        print(f"references: {base}.references.{args.style}.md", file=sys.stderr)
+
+    return 1 if s["errors"] or (args.strict and s["warnings"]) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
