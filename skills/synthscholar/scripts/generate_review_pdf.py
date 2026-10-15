@@ -377,12 +377,17 @@ def _norm_title(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
 
 
+def base_stem(md: Path) -> str:
+    """``review.manuscript.md`` → ``review``: the manuscript shares the review's siblings."""
+    return md.stem[:-len(".manuscript")] if md.stem.endswith(".manuscript") else md.stem
+
+
 def citation_gate(md: Path, report: Optional[Path], allow: bool) -> Optional[str]:
     """Refusal message if the citation report has errors or predates ``md``."""
-    report = report or md.with_name(f"{md.stem}.citations.json")
+    report = report or md.with_name(f"{base_stem(md)}.citations.json")
     if not report.is_file():
         print(f"  warning: {report} not found — citations unverified; run "
-              f"verify_citations.py on {md.stem}.json first (or point --citations at its report)",
+              f"verify_citations.py on {base_stem(md)}.json first (or point --citations at its report)",
               file=sys.stderr)
         return None
     try:
@@ -493,9 +498,98 @@ def fit_images(text: str, base_dirs: list[Path]) -> tuple[str, list[str]]:
     return _outside_fences(text, fix), notes
 
 
+def prepare_images(text: str, base_dirs: list[Path], family: str, tmp: Path) -> tuple[str, list[str]]:
+    """Make every local image resolvable from anywhere, and printable by the engine.
+
+    Paths become absolute, so the intermediate ``.tex`` compiles wherever it is
+    written. On TeX engines an SVG is converted to PDF first: LaTeX cannot
+    include SVG, and leaving it to the engine is what breaks builds.
+    """
+    notes: list[str] = []
+    converted: dict[Path, Optional[Path]] = {}
+
+    def fix(line: str) -> str:
+        def one(m: re.Match) -> str:
+            alt, target, title, attrs = m.group(1), m.group(2), m.group(3) or "", m.group(4) or ""
+            if re.match(r"^(https?:|data:)", target):
+                return m.group(0)
+            path = next((d / target for d in base_dirs if (d / target).is_file()),
+                        Path(target) if Path(target).is_absolute() and Path(target).is_file() else None)
+            if path is None:
+                notes.append(f"WARNING: image not found: {target}")
+                return m.group(0)
+            path = path.resolve()
+            if family in LATEX_ENGINES and path.suffix.lower() == ".svg":
+                if path not in converted:
+                    pdf = tmp / f"img_{len(converted)}_{path.stem}.pdf"
+                    converted[path] = pdf if prisma_flow.svg_to_pdf(path, pdf) else None
+                if converted[path] is None:
+                    notes.append(f"WARNING: {path.name} is SVG and no converter is installed "
+                                 "(rsvg-convert, cairosvg or typst); it is left out of the PDF")
+                    return f"*[Figure file {path.name} could not be converted for this engine]*"
+                path = converted[path]
+            return f"![{alt}]({path}{title}){attrs}"
+        return IMAGE_RE.sub(one, line)
+
+    return _outside_fences(text, fix), notes
+
+
+def estimate_pages(text: str) -> tuple[float, list[tuple[str, float]]]:
+    """Pages the Markdown will take, and the heaviest sections, before rendering.
+
+    The template's estimator: words/550 + table rows/45 + 0.4 per image. Rendering
+    first and finding out after is how a 1,300-page PDF happens.
+    """
+    sections: dict[str, list[int]] = {}
+    current, fence = "front matter", False
+    for line in text.split("\n"):
+        if FENCE_OPEN.match(line):
+            fence = not fence
+        h = None if fence else HEADING.match(line)
+        if h and len(h.group(1)) <= 2:
+            current = h.group(3)
+        w, r, i = sections.setdefault(current, [0, 0, 0])
+        if line.lstrip().startswith("|"):
+            sections[current][1] += 1
+        elif line.lstrip().startswith("!["):
+            sections[current][2] += 1
+        else:
+            sections[current][0] += len(line.split())
+    per = [(name, w / 550 + r / 45 + 0.4 * i) for name, (w, r, i) in sections.items()]
+    return sum(p for _, p in per), sorted(per, key=lambda kv: -kv[1])
+
+
+def pdf_page_count(pdf: Path) -> Optional[int]:
+    """Pages in a PDF: the page tree's ``/Count``, also inside compressed object streams.
+
+    Counting ``/Type /Page`` objects over-counts some writers and misses others
+    (xdvipdfmx packs objects into compressed streams); the root ``/Pages`` node's
+    ``/Count`` is the total either way. Stdlib only.
+    """
+    import zlib
+    try:
+        data = pdf.read_bytes()
+    except OSError:
+        return None
+    chunks = [data]
+    for m in re.finditer(rb"stream\r?\n", data):
+        end = data.find(b"endstream", m.end())
+        if end > 0:
+            try:
+                chunks.append(zlib.decompress(data[m.end():end]))
+            except zlib.error:
+                pass
+    counts = [int(c) for chunk in chunks
+              for c in re.findall(rb"/Type\s*/Pages\b[^>]*?/Count\s+(\d+)|/Count\s+(\d+)[^>]*?/Type\s*/Pages\b", chunk)
+              for c in c if c]
+    return max(counts) if counts else None
+
+
 def insert_flow_diagram(text: str, image: Path) -> tuple[str, bool]:
     """Put the diagram right under the PRISMA flow heading (the counts table stays)."""
-    figure = f"\n![PRISMA 2020 flow diagram]({image}){{width=100%}}\n"
+    if re.search(r"!\[[^\]]*\]\([^)]*(prisma|flow)[^)]*\)", text, re.I):
+        return text, True      # the manuscript already carries it (assemble_manuscript.py)
+    figure = f"\n![]({image}){{width=100%}}\n\n**Figure.** PRISMA 2020 flow diagram.\n"
     hs = headings(text)
     target = next((i for lvl, t, i in hs if re.search(r"prisma\s+flow", t, re.I)), None)
     if target is None:
@@ -508,7 +602,7 @@ def insert_flow_diagram(text: str, image: Path) -> tuple[str, bool]:
 
 def flow_figure(md: Path, flow_json: Optional[Path], family: str, tmp: Path) -> tuple[Optional[Path], str]:
     """(diagram file for this engine, note). SVG for Typst and HTML; PDF for TeX."""
-    src = flow_json or md.with_name(f"{md.stem}.json")
+    src = flow_json or md.with_name(f"{base_stem(md)}.json")
     flow = prisma_flow.load_flow(src) if src.is_file() else None
     if flow is None:
         return None, (f"no flow diagram ({src.name} not found)" if not src.is_file()
@@ -532,10 +626,10 @@ def assemble(md: Path, family: str, references: Optional[str],
     text = neutralise_rules(md.read_text(encoding="utf-8"), keep_front_matter=True)
     notes: list[str] = []
     if references:
-        styled = md.with_name(f"{md.stem}.references.{references}.md")
+        styled = md.with_name(f"{base_stem(md)}.references.{references}.md")
         if not styled.is_file():
             raise ValueError(f"{styled.name} not found — run "
-                             f"verify_citations.py {md.stem}.json --style {references} first")
+                             f"verify_citations.py {base_stem(md)}.json --style {references} first")
         text, done = replace_references(text, styled.read_text(encoding="utf-8"))
         if not done:
             raise ValueError(f"{md.name} has no '## References' section to replace")
@@ -546,7 +640,7 @@ def assemble(md: Path, family: str, references: Optional[str],
         text, title = lift_title(text)
     present = {_norm_title(t) for _, t, _ in headings(text)}
     for name in include:
-        side = md.with_name(md.stem + SIDECARS[name])
+        side = md.with_name(base_stem(md) + SIDECARS[name])
         if not side.is_file():
             raise ValueError(f"{side.name} not found — " + (
                 "run verify_citations.py first" if name == "citations"
@@ -565,7 +659,7 @@ def assemble(md: Path, family: str, references: Optional[str],
             notes.append("flow diagram not placed (no 'PRISMA Flow' or 'Results' heading)")
     text, fitted = fit_images(text, [md.parent])
     notes += fitted
-    return for_engine(text, family), title, notes
+    return text, title, notes
 
 
 # ─────────────────────────── pandoc ────────────────────────────
@@ -576,7 +670,7 @@ def build_command(src: Path, md: Path, out: Path, engine: str, *, meta: Optional
                   number_sections: bool, template: Optional[str], declared: set[str],
                   css: Optional[Path], mainfont: Optional[str]) -> list[str]:
     family = engine_family(engine)
-    cmd = ["pandoc", str(src), "-f", "markdown", "-o", str(out), f"--pdf-engine={engine}",
+    cmd = ["pandoc", str(src), "-f", "markdown-implicit_figures", "-o", str(out), f"--pdf-engine={engine}",
            # images resolve relative to the review, not to the temp copy
            "--resource-path", os.pathsep.join([str(md.parent), "."]
                                               + ([str(extra_resources)] if extra_resources else [])),
@@ -622,16 +716,30 @@ def _missing_glyphs(log: str) -> list[str]:
 def generate_pdf(markdown_file: str, output_pdf: Optional[str] = None, *,
                  citation_style: str = "apa", references: Optional[str] = None,
                  include: Optional[list[str]] = None, template: Optional[str] = None,
-                 toc: bool = True, number_sections: bool = False,
+                 toc: Optional[bool] = None, number_sections: bool = False,
                  pdf_engine: Optional[str] = None, bibliography: Optional[str] = None,
                  citations: Optional[str] = None, allow_citation_errors: bool = False,
                  mainfont: Optional[str] = None, dry_run: bool = False,
                  keep_source: bool = False, timeout: int = 900,
-                 flow_diagram: bool = True, flow_json: Optional[str] = None) -> bool:
+                 flow_diagram: bool = True, flow_json: Optional[str] = None,
+                 page_limit: int = 50, allow_over_limit: bool = False, keep_tex: bool = True) -> bool:
     md = Path(markdown_file)
     if not md.is_file():
         print(f"Error: markdown file not found: {md}", file=sys.stderr)
         return False
+    manuscript = md.with_name(f"{md.stem}.manuscript.md")
+    if not md.stem.endswith(".manuscript") and manuscript.is_file():
+        # the raw export inlines every record; the manuscript is the paper
+        print(f"  building {manuscript.name} (the assembled manuscript), not the raw {md.name}",
+              file=sys.stderr)
+        md = manuscript
+    elif not md.stem.endswith(".manuscript"):
+        print(f"  warning: {md.name} is the raw export, not an assembled manuscript — run "
+              "assemble_manuscript.py first for the paper layout; the page limit still applies",
+              file=sys.stderr)
+    if toc is None:
+        # a journal manuscript has no contents page: front matter and abstract open page 1
+        toc = not md.stem.endswith(".manuscript")
     if not shutil.which("pandoc"):
         print("Error: pandoc not found. Install with:\n"
               "  conda install -c conda-forge pandoc   # or: brew / apt install pandoc",
@@ -659,6 +767,7 @@ def generate_pdf(markdown_file: str, output_pdf: Optional[str] = None, *,
     tmpdir = tempfile.TemporaryDirectory(prefix="review-pdf-")
     try:
         return _build(md, output_pdf, Path(tmpdir.name), engine=engine, family=family,
+                      page_limit=page_limit, allow_over_limit=allow_over_limit, keep_tex=keep_tex,
                       citation_style=citation_style, references=references, include=include,
                       template=template, toc=toc, number_sections=number_sections,
                       bibliography=bibliography, mainfont=mainfont, dry_run=dry_run,
@@ -669,12 +778,20 @@ def generate_pdf(markdown_file: str, output_pdf: Optional[str] = None, *,
 
 
 def _build(md: Path, output_pdf: Optional[str], tmp: Path, *, engine: str, family: str,
+           page_limit: int = 50, allow_over_limit: bool = False, keep_tex: bool = True,
            citation_style: str, references: Optional[str], include: Optional[list[str]],
            template: Optional[str], toc: bool, number_sections: bool, bibliography: Optional[str],
            mainfont: Optional[str], dry_run: bool, keep_source: bool, timeout: int,
            flow_diagram: bool, flow_json: Optional[Path]) -> bool:
-    flow_image, flow_note = (flow_figure(md, flow_json, family, tmp) if flow_diagram
-                             else (None, ""))
+    # #3: a kept .tex must still compile after the temp dir is gone, so images
+    # converted for it live in <name>_files/ beside it, not in the temp dir.
+    out_path = Path(output_pdf) if output_pdf else md.with_suffix(".pdf")
+    assets = out_path.with_name(f"{out_path.stem}_files") if (family in LATEX_ENGINES and keep_tex) else tmp
+    assets.mkdir(parents=True, exist_ok=True)
+    assets = assets.resolve()      # the engine compiles from the temp dir: paths must be absolute
+    has_flow = bool(re.search(r"!\[[^\]]*\]\([^)]*(prisma|flow)[^)]*\)", md.read_text(encoding="utf-8"), re.I))
+    flow_image, flow_note = (flow_figure(md, flow_json, family, assets)
+                             if flow_diagram and not has_flow else (None, ""))
     try:
         text, title, notes = assemble(md, family, references, include or [], flow_image)
     except ValueError as e:
@@ -683,6 +800,20 @@ def _build(md: Path, output_pdf: Optional[str], tmp: Path, *, engine: str, famil
     if flow_note:
         (print(f"  {flow_note}", file=sys.stderr) if flow_note.startswith("WARNING")
          else notes.insert(0, flow_note))
+    text, img_notes = prepare_images(text, [md.parent], family, assets)
+    for n in img_notes:
+        print(f"  {n}", file=sys.stderr)
+    text = for_engine(text, family)
+
+    est, heavy = estimate_pages(text)
+    if page_limit and est > page_limit and not allow_over_limit:
+        top = "\n".join(f"    {name[:60]:<60} ~{pages:.0f} pages" for name, pages in heavy[:6])
+        print(f"Error: this document would run to about {est:.0f} pages, over the {page_limit}-page limit. "
+              f"Heaviest sections:\n{top}\n"
+              "  Build from the assembled manuscript (assemble_manuscript.py), which moves per-record "
+              "appendices to sibling files, or pass --allow-over-limit.", file=sys.stderr)
+        return False
+    notes.append(f"~{est:.0f} pages estimated")
 
     out = Path(output_pdf) if output_pdf else md.with_suffix(".pdf")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -742,9 +873,12 @@ def _build(md: Path, output_pdf: Optional[str], tmp: Path, *, engine: str, famil
             return True
         print(f"Writing: {out}", file=sys.stderr)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if family in LATEX_ENGINES:
+                result = latex_route(cmd, out, engine, family, tmp, timeout, keep_tex)
+            else:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            print(f"Error: pandoc did not finish within {timeout}s "
+            print(f"Error: the build did not finish within {timeout}s "
                   "(tectonic's first run downloads its TeX bundle; retry, or raise --timeout)",
                   file=sys.stderr)
             return False
@@ -771,8 +905,54 @@ def _build(md: Path, output_pdf: Optional[str], tmp: Path, *, engine: str, famil
         print(f"  WARNING: {len(missing)} character(s) missing from the PDF's font: "
               f"{' '.join(missing[:30])} — pass --mainfont with a font that has them",
               file=sys.stderr)
-    print(f"Done: {out} ({out.stat().st_size / 1024:.0f} KB)", file=sys.stderr)
+    pages = pdf_page_count(out)
+    print(f"Done: {out} ({out.stat().st_size / 1024:.0f} KB"
+          + (f", {pages} pages" if pages else "") + ")", file=sys.stderr)
+    if page_limit and pages and pages > page_limit and not allow_over_limit:
+        print(f"Error: the PDF has {pages} pages, over the {page_limit}-page limit — move per-record "
+              "material to sibling files (assemble_manuscript.py) rather than cutting the synthesis",
+              file=sys.stderr)
+        return False
     return True
+
+
+def latex_route(cmd: list[str], out: Path, engine: str, family: str, tmp: Path,
+                timeout: int, keep_tex: bool) -> subprocess.CompletedProcess:
+    """Markdown → standalone .tex (pandoc) → PDF (the TeX engine, run directly).
+
+    Two explicit steps instead of pandoc's internal one: the .tex is kept next
+    to the PDF (``<name>.tex``) so the source of every page can be inspected or
+    edited, and the engine's own log is what errors are reported from.
+    """
+    tex = tmp / f"{out.stem}.tex"
+    to_tex = [c for c in cmd if not c.startswith("--pdf-engine")]
+    to_tex[to_tex.index("-o") + 1] = str(tex)
+    to_tex += ["-t", "latex"]
+    r = subprocess.run(to_tex, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        return r
+    if keep_tex:
+        shutil.copy(tex, out.with_suffix(".tex"))   # its images are in <name>_files/ beside it
+    if family == "tectonic":
+        runs = [[engine, "--keep-logs", "--outdir", str(tmp), str(tex)]]
+    else:
+        base = [engine, "-interaction=nonstopmode", "-halt-on-error", f"-output-directory={tmp}", str(tex)]
+        runs = [base, base]                      # second pass settles the TOC and references
+    log = ""
+    for run in runs:
+        rr = subprocess.run(run, capture_output=True, text=True, timeout=timeout, cwd=str(tmp))
+        log += rr.stdout + rr.stderr
+        if rr.returncode != 0:
+            return subprocess.CompletedProcess(run, rr.returncode, rr.stdout, rr.stderr)
+    logfile = tmp / f"{out.stem}.log"
+    if logfile.is_file():
+        log += logfile.read_text(encoding="utf-8", errors="replace")
+    shutil.copy(tmp / f"{out.stem}.pdf", out)
+    # keep only the lines a reader acts on: real warnings, not TeX's box chatter
+    useful = "\n".join(ln for ln in log.splitlines()
+                       if ("Missing character" in ln or "LaTeX Warning" in ln or "accessing absolute path" in ln)
+                       and "Underfull" not in ln and "Overfull" not in ln)
+    return subprocess.CompletedProcess(runs[-1], 0, "", useful)
 
 
 def _shell_quote(s: str) -> str:
@@ -827,9 +1007,16 @@ def main() -> int:
     p.add_argument("--pdf-engine", help=f"force an engine ({', '.join(ALL_ENGINES)}), name or path")
     p.add_argument("--mainfont", help="TeX main font (default: an installed font covering the text)")
     p.add_argument("--template", help="custom pandoc template")
-    p.add_argument("--no-toc", action="store_true")
+    p.add_argument("--toc", dest="toc", action="store_true", default=None,
+                   help="contents page (default: on for a raw export, off for a manuscript)")
+    p.add_argument("--no-toc", dest="toc", action="store_false")
     p.add_argument("--number-sections", action="store_true",
                    help="pandoc section numbers (off: the review numbers its own)")
+    p.add_argument("--page-limit", type=int, default=50,
+                   help="refuse to build past this many pages (estimated before, counted after; default 50)")
+    p.add_argument("--allow-over-limit", action="store_true", help="build even when over --page-limit")
+    p.add_argument("--no-tex", action="store_true",
+                   help="LaTeX route: don't keep the intermediate .tex next to the PDF")
     p.add_argument("--no-flow-diagram", action="store_true",
                    help="don't draw the PRISMA 2020 flow diagram under the PRISMA Flow heading")
     p.add_argument("--flow-json", metavar="REVIEW_JSON",
@@ -847,12 +1034,14 @@ def main() -> int:
         p.error("markdown_file is required (or use --check-deps)")
     ok = generate_pdf(args.markdown_file, args.output, citation_style=args.citation_style,
                       references=args.references, include=args.include, template=args.template,
-                      toc=not args.no_toc, number_sections=args.number_sections,
+                      toc=args.toc, number_sections=args.number_sections,
                       pdf_engine=args.pdf_engine, bibliography=args.bibliography,
                       citations=args.citations, allow_citation_errors=args.allow_citation_errors,
                       mainfont=args.mainfont, dry_run=args.dry_run,
                       keep_source=args.keep_source, timeout=args.timeout,
-                      flow_diagram=not args.no_flow_diagram, flow_json=args.flow_json)
+                      flow_diagram=not args.no_flow_diagram, flow_json=args.flow_json,
+                      page_limit=args.page_limit, allow_over_limit=args.allow_over_limit,
+                      keep_tex=not args.no_tex)
     return 0 if ok else 1
 
 

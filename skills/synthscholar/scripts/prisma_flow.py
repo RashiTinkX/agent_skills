@@ -83,7 +83,8 @@ def flow_lines(flow: dict) -> dict[str, list[str]]:
         sources.append(f"Citation searching (n = {_n(flow['db_hops'])})")
     if not sources:
         sources = [f"Databases and registers (n = {_n(flow.get('total_identified'))})"]
-    reasons = flow.get("excluded_reasons") or {}
+    # eligibility-stage reasons: the per-stage field when recorded, else the combined one
+    reasons = flow.get("excluded_reasons_full_text") or flow.get("excluded_reasons") or {}
     excluded = ([f"{r} (n = {_n(c)})" for r, c in sorted(reasons.items(), key=lambda kv: -int(kv[1] or 0))]
                 or [f"(n = {_n(flow.get('excluded_eligibility'))})"])
     return {
@@ -199,18 +200,22 @@ def svg_to_pdf(svg: Path, pdf: Path) -> Optional[str]:
     return None
 
 
+def load_flow_dict(flow: object) -> Optional[dict]:
+    """``flow`` if it holds counts worth drawing, else None."""
+    if not isinstance(flow, dict) or not any(
+            int(flow.get(k) or 0) for k in ("total_identified", "screened_title_abstract",
+                                             "assessed_eligibility", "included_synthesis")):
+        return None
+    return flow
+
+
 def load_flow(review_json: Path) -> Optional[dict]:
     """The review's flow counts, or None when there is nothing to draw."""
     try:
         data = json.loads(review_json.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    flow = data.get("flow") if isinstance(data, dict) else None
-    if not isinstance(flow, dict) or not any(
-            int(flow.get(k) or 0) for k in ("total_identified", "screened_title_abstract",
-                                             "assessed_eligibility", "included_synthesis")):
-        return None
-    return flow
+    return load_flow_dict(data.get("flow") if isinstance(data, dict) else None)
 
 
 def main() -> int:
