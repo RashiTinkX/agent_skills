@@ -212,6 +212,26 @@ python scripts/research_questions.py out/review.json --outdir out/ --themes them
 - **Complete the corpus metadata yourself** from each entry's `_head_text` —
   don't hand the user a list of fields to fill. Never invent a DOI or year;
   leave it empty instead.
+- **Identify every paper by its published version, with its PMID.** These
+  rules apply to the reference list, in-text citations and fetching alike:
+  - **Cite the peer-reviewed version.** When a study exists as both a
+    preprint and a peer-reviewed article, cite, fetch and read the
+    peer-reviewed article. Its venue DOI is the article's DOI.
+  - **Add the PubMed ID wherever PubMed has the article.**
+  - **Cite a preprint only when no peer-reviewed version exists.** Label it
+    as a preprint, and say in the limitations that it is not peer-reviewed.
+
+  The scripts do this:
+  - `fetch_ezproxy.py` tries the published version first.
+  - `verify_citations.py` reports a preprint with a published version,
+    adds missing PMIDs, and `--apply` makes both changes, rewriting the
+    article's id everywhere it appears in the review.
+  - The styled reference list ends each entry with its PMID.
+
+  A switched version may report different numbers: re-check the extracted
+  results against the published text. A preprint and its published version
+  are one study, and including both is an error: exclude one and correct
+  the PRISMA counts.
 - **Ask for the search strategy, but never block on it.** Databases, exact
   query strings, dates searched, filters, records identified, duplicates
   removed — ask as one batch of structured questions. If the user doesn't have

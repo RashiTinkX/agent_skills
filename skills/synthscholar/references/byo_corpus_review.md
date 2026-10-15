@@ -198,6 +198,13 @@ Notes that matter:
   and the user completes it themselves. Only the proxy's resulting session
   cookies are kept. They expire; an expired session is detected before use
   and the browser reopens, rather than the failure looking like a paywall.
+- **The peer-reviewed version is fetched first.** A preprint DOI (bioRxiv,
+  medRxiv, arXiv, Research Square, SSRN, PsyArXiv, …) is looked up for a
+  registry-linked published version. That version is tried on both routes,
+  open access and then the proxy, before the preprint itself. The corpus
+  entry's `doi` becomes the published one, with the preprint in
+  `_preprint_doi`; in `--doi` mode the manifest records `version` and
+  `preprint_doi`. `--as-given` fetches exactly the DOI supplied.
 - **An open-access miss is not a failure.** Most DOIs have no free copy; that's
   normal and says nothing about the next one. Only *proxied* failures trip the
   stop-after-3 circuit breaker, because those really do indicate a dead session.

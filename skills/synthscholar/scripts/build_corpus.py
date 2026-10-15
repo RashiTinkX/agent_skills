@@ -391,6 +391,9 @@ def build_item(
             item[k] = v
             if k in guesses:
                 guesses.remove(k)
+        elif k == "preprint_doi" and v:
+            # fetch_ezproxy.py read the peer-reviewed version in place of this preprint
+            item["_preprint_doi"] = v
 
     item["_pdf_path"] = str(pdf)
     item["_pdf_sha256"] = file_sha

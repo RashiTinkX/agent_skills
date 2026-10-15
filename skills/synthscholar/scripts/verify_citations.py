@@ -87,6 +87,7 @@ CROSSREF = "https://api.crossref.org/works"
 HANDLE = "https://doi.org/api/handles/"
 DOI_RESOLVER = "https://doi.org/"
 ESUMMARY = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 
 # DOI = "10." + registrant + "/" + suffix. The suffix may legally contain
 # ".", ";", "(" and ")" (Elsevier's 10.1016/S0140-6736(09)60937-1), so
@@ -144,6 +145,37 @@ STRUCTURED_ID_KEYS = {"paper_pmid", "pmid"}  # plus any key ending in "_pmids"
 QUOTED = {"evidence_spans"}
 
 SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2}
+# Preprint servers, by DOI prefix and by venue name. A preprint is cited only
+# when no peer-reviewed version exists; see preferred_versions().
+PREPRINT_DOI_PREFIXES = (
+    "10.1101/",         # bioRxiv, medRxiv
+    "10.48550/",        # arXiv
+    "10.21203/",        # Research Square
+    "10.20944/",        # Preprints.org
+    "10.31234/",        # PsyArXiv
+    "10.31219/",        # OSF Preprints
+    "10.31235/",        # SocArXiv
+    "10.26434/",        # ChemRxiv
+    "10.36227/",        # TechRxiv
+    "10.22541/",        # Authorea
+    "10.2139/ssrn",     # SSRN
+    "10.1590/scielopreprints",
+)
+PREPRINT_VENUES = re.compile(
+    r"\b(bio|med|chem|tech|psy|soc|edu|meta)?rxiv\b|\barxiv\b|research square|\bssrn\b|"
+    r"preprints\.org|\bosf preprints\b|authorea", re.I)
+
+
+def is_preprint(doi: str, meta: Optional[dict] = None) -> bool:
+    """A preprint by registry type, DOI prefix or venue name."""
+    m = meta or {}
+    if m.get("type") == "posted-content" or m.get("subtype") == "preprint":
+        return True
+    if any(clean_doi(doi).lower().startswith(p) for p in PREPRINT_DOI_PREFIXES):
+        return True
+    return bool(PREPRINT_VENUES.search(m.get("journal") or ""))
+
+
 # Reference-list styles render_reference() knows. generate_review_pdf.py takes
 # whatever <stem>.references.<style>.md this wrote, so this is the one list.
 STYLES = ("apa", "nature", "vancouver", "ieee")
@@ -338,6 +370,81 @@ class Registry:
                           "title_similarity": round(title_similarity(title, m["title"]), 3)})
         return sorted(cands, key=lambda c: -c["title_similarity"])
 
+    def find_published_version(self, title: str, authors: str, year: str) -> list[dict]:
+        """Peer-reviewed records matching a preprint by title, first author and year.
+
+        Candidates only: without a registry link between the two records, a
+        matching title is evidence, not proof, that they are the same work.
+        """
+        if len(norm_text(title)) < 5:
+            return []
+        q = " ".join(x for x in (title, first_author_segment(authors)) if x)
+        r = self._get(CROSSREF, self._crossref_params(
+            {"query.bibliographic": q, "rows": 5, "filter": "type:journal-article",
+             "select": "DOI,title,author,issued,container-title,type"}))
+        time.sleep(self.delay)
+        body = _json(r) if r is not None and r.status_code == 200 else None
+        if body is None:
+            return []
+        py = first_year(year)
+        out = []
+        for item in (body.get("message") or {}).get("items") or []:
+            m = parse_crossref(item)
+            fam = m["authors"][0][0] if m["authors"] else ""
+            if (title_similarity(title, m["title"]) >= TITLE_MATCH and fam
+                    and surname_matches(fam, authors) and not is_preprint(m["doi"], m)
+                    and (not py or not m["year"] or m["year"] >= py)):
+                out.append({"doi": m["doi"], "title": m["title"], "year": m["year"],
+                            "journal": m["journal"]})
+        return out
+
+    def published_versions(self, doi: str, meta: dict) -> list[str]:
+        """Registry-linked peer-reviewed versions of preprint ``doi``.
+
+        The link is usually asserted by the *publisher*: the journal article
+        carries ``has-preprint`` → the preprint, while the preprint's own record
+        is left empty. So both directions are read: the preprint's
+        ``is-preprint-of``, and any work whose ``has-preprint`` names it.
+        """
+        found = [clean_doi(d) for d in meta.get("published_as") or [] if d]
+        r = self._get(CROSSREF, self._crossref_params(
+            {"filter": f"relation.type:has-preprint,relation.object:{clean_doi(doi)}",
+             "rows": 5, "select": "DOI,type"}))
+        time.sleep(self.delay)
+        body = _json(r) if r is not None and r.status_code == 200 else None
+        for item in ((body or {}).get("message") or {}).get("items") or []:
+            d = clean_doi(item.get("DOI", ""))
+            if d and item.get("type") != "posted-content" and d.lower() not in {x.lower() for x in found}:
+                found.append(d)
+        return found
+
+    def preferred_versions(self, doi: str) -> list[tuple[str, str]]:
+        """DOIs to cite or fetch for ``doi``, best first: [(doi, 'published'|'preprint'|'as-given')].
+
+        A preprint with a registry-linked peer-reviewed version (either
+        direction, see published_versions) puts that version first. Anything
+        else is returned as given.
+        """
+        doi = clean_doi(doi)
+        status, meta = self.lookup_doi(doi, check_updates=False)
+        if status not in ("crossref", "other-registry") or not is_preprint(doi, meta):
+            return [(doi, "as-given")]
+        return [(d, "published") for d in self.published_versions(doi, meta)] + [(doi, "preprint")]
+
+    def pmid_for_doi(self, doi: str) -> Optional[str]:
+        """The PubMed ID registered for ``doi``, if PubMed has exactly one."""
+        params = {"db": "pubmed", "term": f"{clean_doi(doi)}[doi]", "retmode": "json",
+                  "tool": "synthscholar-skill"}
+        if self.mailto:
+            params["email"] = self.mailto
+        if self.ncbi_key:
+            params["api_key"] = self.ncbi_key
+        r = self._get(ESEARCH, params)
+        time.sleep(0.12 if self.ncbi_key else 0.4)
+        body = _json(r) if r is not None and r.status_code == 200 else None
+        ids = ((body or {}).get("esearchresult") or {}).get("idlist") or []
+        return ids[0] if len(ids) == 1 else None
+
     # ---- PubMed ----
 
     def lookup_pmids(self, pmids: list[str]) -> dict[str, Optional[dict]]:
@@ -455,7 +562,9 @@ def parse_crossref(msg: dict) -> dict:
                      "notice_doi": u.get("DOI", ""), "date": _date(u.get("updated")),
                      "source": u.get("source", "crossref")}
                     for u in msg.get("updated-by") or []],
-        "published_as": [r.get("id", "") for r in rel.get("is-preprint-of") or []],
+        "published_as": [r.get("id", "") for r in rel.get("is-preprint-of") or []
+                         if (r.get("id-type") or "doi") == "doi"],
+        "subtype": msg.get("subtype", ""),
     }
 
 
@@ -554,9 +663,6 @@ def check_registry_record(claimed: dict, meta: dict, line_mode: bool = False) ->
         sev = "error" if n["type"] in UPDATE_ERROR else "warning"
         out.append(finding("cites-notice", sev,
                            f"This DOI is a {n['type'] or 'notice'} for {n['doi']}, not a study"))
-    if meta.get("published_as") and title_ok:
-        out.append(finding("preprint-published", "info",
-                           "Preprint; published version: " + ", ".join(meta["published_as"])))
     return out
 
 
@@ -704,9 +810,32 @@ class Verifier:
             print(f"[{n:>3}/{len(refs)}] {rec['status']:>9}  {c['key']}"
                   + (f"  {rec['doi']}" if rec["doi"] else ""), file=sys.stderr)
 
+        self._flag_duplicate_versions(report)
         self._verify_in_text(review, refs, report)
         report["grounding_validation"] = _grounding_summary(review.get("grounding_validation"))
         return report
+
+    @staticmethod
+    def _flag_duplicate_versions(report: dict) -> None:
+        """Two included entries that resolve to one work (a preprint and its
+        published version): one study counted twice. Neither is switched."""
+        by_doi: dict[str, str] = {}
+        for r in report["references"]:
+            for d in {clean_doi(r["claimed"]["doi"]).lower(), (r["doi"] or "").lower()} - {""}:
+                if d in by_doi and by_doi[d] != r["key"]:
+                    report["review_findings"].append(finding(
+                        "duplicate-study", "error",
+                        f"{by_doi[d]} and {r['key']} are the same work ({d}) — a preprint and its "
+                        "published version are one study: keep the published one, exclude the "
+                        "other, and correct the PRISMA counts"))
+                    for rr in report["references"]:
+                        if rr["key"] in (by_doi[d], r["key"]):
+                            # the fix is an exclusion, not a rewrite: undo the
+                            # version switch and identifier fills on both entries
+                            for k in rr.get("version_switch", []) + ["doi", "pmid"]:
+                                rr["suggested"].pop(k, None)
+                else:
+                    by_doi.setdefault(d, r["key"])
 
     @staticmethod
     def _claimed(a: dict) -> dict:
@@ -773,6 +902,8 @@ class Verifier:
                 findings += check_registry_record(c, meta)
                 if _record_confirmed(c, meta):
                     rec["suggested"].update(_fill_empty(c, meta))
+                    if is_preprint(doi, meta):
+                        findings += self._prefer_published(c, rec, doi, meta)
         elif not c["pmid"] or not REAL_PMID.match(c["pmid"]) or rec["pubmed"] is None:
             findings.append(finding("doi-missing", "warning",
                                     "No DOI or PMID to verify this reference against"))
@@ -792,9 +923,68 @@ class Verifier:
                                         f"Crossref match by title: {cands[0]['doi']} "
                                         f"(similarity {cands[0]['title_similarity']:.2f}) — confirm before using"))
 
+        findings += self._add_pmid(c, rec)
         rec["findings"] = findings
         rec["status"] = worst(findings)
         return rec
+
+    def _prefer_published(self, c: dict, rec: dict, doi: str, meta: dict) -> list[dict]:
+        """Peer-reviewed version first: switch to it when the registry links it."""
+        rec["version"] = "preprint"
+        pubs = self.reg.published_versions(doi, meta)
+        for pub in pubs:
+            status, pm = self.reg.lookup_doi(pub, self.check_updates)
+            if status not in ("crossref", "other-registry"):
+                continue
+            rec["version"] = "published"
+            rec["published"] = pm
+            rec["version_switch"] = ["doi", "journal", "year", "title"]
+            rec["suggested"].update({"doi": pm.get("doi") or pub,
+                                     **{k: v for k, v in (("journal", pm.get("journal")),
+                                                          ("year", str(pm.get("year") or "")),
+                                                          ("title", pm.get("title"))) if v}})
+            rec["doi"] = clean_doi(pm.get("doi") or pub)
+            out = [finding("preprint-has-published-version", "warning",
+                           f"Cites the preprint {doi}; the peer-reviewed version is {rec['doi']} "
+                           f"({pm.get('journal') or 'journal'}, {pm.get('year') or 'n.d.'}). Cite that — "
+                           "and check the review's extracted numbers against it, since results can "
+                           "change in peer review")]
+            out += [f for f in check_registry_record({**c, "title": pm.get("title", ""),
+                                                      "authors": c["authors"], "year": ""}, pm)
+                    if f["code"] in ("retracted", "cites-notice") or f["code"].startswith("update-")]
+            return out
+        if self.search_missing:
+            cands = self.reg.find_published_version(c["title"] or meta.get("title", ""),
+                                                    c["authors"], c["year"])
+            if cands:
+                rec["published_candidates"] = cands
+                return [finding("preprint-published-candidate", "warning",
+                                f"Cites the preprint {doi}; a peer-reviewed version appears to be "
+                                f"{cands[0]['doi']} ({cands[0]['journal']}, {cands[0]['year']}) — "
+                                "confirm it is the same work, then cite it")]
+        return [finding("preprint-only", "info",
+                        f"{doi} is a preprint with no peer-reviewed version found: say in the "
+                        "review's limitations that it is not peer-reviewed")]
+
+    def _add_pmid(self, c: dict, rec: dict) -> list[dict]:
+        """Record the PubMed ID wherever PubMed has the (cited) article."""
+        if self.reg is None or not rec["doi"]:
+            return []
+        switched = rec.get("version") == "published"
+        if REAL_PMID.match(c["pmid"]) and not switched:
+            return []
+        found = self.reg.pmid_for_doi(rec["doi"])
+        if not found or found == c["pmid"]:
+            return []
+        pm = (self.reg.lookup_pmids([found]) or {}).get(found)
+        want = (rec.get("published") or rec.get("registry") or {}).get("title") or c["title"]
+        if not pm or title_similarity(want, pm["title"]) < TITLE_MATCH:
+            return []
+        rec["suggested"]["pmid"] = found
+        rec["pubmed"] = pm
+        return [finding("pmid-found", "info",
+                        f"PubMed has this article as PMID {found}"
+                        + (f" (the review uses {c['pmid']})" if c["pmid"] else ""))]
 
     def _verify_in_text(self, review: dict, refs: list[dict], report: dict) -> None:
         by_pmid = {c["pmid"].lower(): c for c in refs if c["pmid"]}
@@ -1014,8 +1204,21 @@ def _authors_style(authors: list[tuple[str, str]], style: str) -> str:
 
 
 def render_reference(rec: dict, style: str) -> str:
-    m = rec.get("registry") or {}
-    trusted = m and m.get("title_similarity", 0) >= TITLE_MATCH and m.get("authors")
+    """One reference: the peer-reviewed version when there is one, then its
+    PMID when PubMed has it; a preprint with no published version is labelled."""
+    base = _render_reference(rec, style)
+    pmid = rec["suggested"].get("pmid") or (rec["pmid"] if REAL_PMID.match(rec["pmid"] or "") else "")
+    if pmid:
+        base = base.rstrip(".") + f". PMID: {pmid}."
+    if rec.get("version") == "preprint":
+        base += " [Preprint — not peer-reviewed]"
+    return base
+
+
+def _render_reference(rec: dict, style: str) -> str:
+    m = rec.get("published") or rec.get("registry") or {}
+    trusted = m and (rec.get("published") is m or m.get("title_similarity", 0) >= TITLE_MATCH) \
+        and m.get("authors")
     c = rec["claimed"]
     if not trusted:
         doi = f" https://doi.org/{rec['doi']}" if rec["doi"] else ""
@@ -1133,10 +1336,49 @@ def apply_fixes(review: dict, report: dict) -> list[dict]:
             continue
         for field, value in rec["suggested"].items():
             if str(a.get(field) or "") != value:
-                applied.append({"key": rec["key"], "field": field,
-                                "old": a.get(field, ""), "new": value})
+                old = a.get(field, "")
                 a[field] = value
+                entry = {"key": rec["key"], "field": field, "old": old, "new": value}
+                if field == "pmid" and old:
+                    entry["references_updated"] = _rekey(review, str(old), value, skip=a)
+                applied.append(entry)
     return applied
+
+
+def _rekey(review: dict, old: str, new: str, skip: dict) -> int:
+    """Replace article id ``old`` with ``new`` across the review; count replacements.
+
+    The id is the article's key everywhere: screening log, evidence spans,
+    rubrics, per-group lists and "PMID: …" citations in the prose. A ``local_``
+    id is a unique hash, so it is replaced wherever it appears as a token; a
+    numeric one only as a whole value or after "PMID".
+    """
+    tok = re.compile(rf"(?<![\w]){re.escape(old)}(?![\w])") if old.startswith("local_") \
+        else re.compile(rf"(\bPMIDs?\s*[:#]?\s*(?:[\w]+\s*(?:,|and|&)\s*)*){re.escape(old)}\b", re.I)
+    count = 0
+
+    def fix(node: Any) -> Any:
+        nonlocal count
+        if node is skip:
+            return node
+        if isinstance(node, dict):
+            for k, v in node.items():
+                node[k] = fix(v)
+            return node
+        if isinstance(node, list):
+            return [fix(v) for v in node]
+        if isinstance(node, str):
+            if node == old:
+                count += 1
+                return new
+            out, n = (tok.subn(new, node) if old.startswith("local_")
+                      else tok.subn(lambda m: m.group(1) + new, node))
+            count += n
+            return out
+        return node
+
+    fix(review)
+    return count
 
 
 # ─────────────────────────── CLI ────────────────────────────
