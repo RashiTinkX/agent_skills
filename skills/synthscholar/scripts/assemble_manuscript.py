@@ -64,15 +64,84 @@ def _words(text: str) -> int:
     return len(re.findall(r"[A-Za-z0-9][\w'’-]*", text))
 
 
-def _cell(v: Any, cap: int = 120) -> str:
+def _cell(v: Any, cap: Optional[int] = None) -> str:
+    """A table cell. Authored prose is never cut; ``cap`` is for per-record data columns,
+    and cuts at a word boundary so a cell never ends mid-word."""
     t = re.sub(r"\s+", " ", _s(v)).strip().replace("|", "\\|")
-    return t if len(t) <= cap else t[:cap - 1] + "…"
+    if cap is None or len(t) <= cap:
+        return t
+    return t[:cap].rsplit(" ", 1)[0].rstrip(",;:") + " …"
 
 
-def _table(header: list[str], rows: list[list[Any]]) -> list[str]:
-    out = ["| " + " | ".join(header) + " |", "|" + "|".join("---" for _ in header) + "|"]
-    out += ["| " + " | ".join(_cell(c) for c in r) + " |" for r in rows]
+def _widths(header: list[str], rows: list[list[str]], budget: int = 90) -> list[int]:
+    """Relative column widths from the content: pandoc reads them from the dash counts.
+
+    Equal dashes make every column the same width, so a 4-character year column
+    gets as much room as a 300-character description and the description wraps
+    one word per line. Each column wants its typical (not longest) cell, and is
+    never narrower than its longest word ("NKG-005", "2009", "representation"),
+    so short columns never split a word. When the wants exceed ``budget``
+    characters (about one line of table type), only the wide columns give way.
+    """
+    floors, wants = [], []
+    for j, h in enumerate(header):
+        col = [r[j] for r in rows if j < len(r)]
+        lens = sorted(len(c) for c in col) or [0]
+        typical = lens[int(0.75 * (len(lens) - 1))]
+        word = max((len(w) for c in col for w in c.split()), default=3)
+        head = max((len(w) for w in h.split()), default=3)
+        # a long header word ("publications" over a column of 1s) may run a little
+        # wide rather than take a dozen characters from the column beside it
+        floor = max(3, min(14, word), min(10, head))
+        floors.append(floor)
+        wants.append(max(floor, min(60, typical)))
+    slack = sum(wants) - sum(floors)
+    room = budget - sum(floors)
+    if sum(wants) > budget and slack > 0:
+        scale = max(0.0, room) / slack
+        wants = [f + (w - f) * scale for f, w in zip(floors, wants)]
+    return [max(3, round(w)) for w in wants]
+
+
+def _table(header: list[str], rows: list[list[Any]], caps: Optional[list[Optional[int]]] = None) -> list[str]:
+    limits: list[Optional[int]] = list(caps) if caps else [None] * len(header)
+    cells = [[_cell(c, limits[j] if j < len(limits) else None) for j, c in enumerate(r)] for r in rows]
+    header = [_s(h).replace("_", " ") for h in header]   # data keys ("resource_id") read as words
+    out = ["| " + " | ".join(header) + " |", "|" + "|".join("-" * w for w in _widths(header, cells)) + "|"]
+    out += ["| " + " | ".join(r) + " |" for r in cells]
     return out + [""]
+
+
+def _criteria(v: Any) -> list[str]:
+    """Criteria as a list: given as one, split on lines, '; ' or their own codes (IC1 … IC2 …)."""
+    if isinstance(v, list):
+        return [_s(x).strip() for x in v if _s(x).strip()]
+    parts = re.split(r"\n|;\s+|\s+(?=\b[IE]C\d+\b)", _s(v))
+    return [x.strip() for x in parts if x.strip()]
+
+
+def _short_cite(v: Any) -> str:
+    """'Larson SD, Martone ME (2009). Ontologies for …' → 'Larson and Martone (2009)'."""
+    t = _s(v).strip()
+    m = re.match(r"^(.*?)\s*\((\d{4}[a-z]?)\)", t)
+    if not m:
+        return t
+    etal = "et al" in m.group(1)
+    authors = re.sub(r"\bet al\.?", "", m.group(1))
+    names = [re.sub(r"\s+[A-Z][A-Z-]{0,3}$", "", n.strip()) for n in re.split(r",|;|&| and ", authors)]
+    names = [n for n in names if n]
+    if not names:
+        return t
+    who = (f"{names[0]} et al." if etal or len(names) > 2
+           else " and ".join(names))
+    return f"{who} ({m.group(2)})"
+
+
+def _strip_label(v: Any, name: str) -> str:
+    """'Maturity verdict: emerging …' under a 'Maturity' label → 'emerging …'."""
+    t = _s(v).strip()
+    first = name.split()[0]
+    return re.sub(rf"^{re.escape(first)}[\w ]*?:\s*", "", t, flags=re.I) if t else t
 
 
 def _get(d: Any, *path: str, default: Any = "") -> Any:
@@ -163,8 +232,9 @@ class Manuscript:
             self.section_words[key] = self.section_words.get(key, 0) + n
         return n
 
-    def table(self, header: list[str], rows: list[list[Any]], appendix: bool = False) -> None:
-        self.lines += _table(header, rows)
+    def table(self, header: list[str], rows: list[list[Any]], appendix: bool = False,
+              caps: Optional[list[Optional[int]]] = None) -> None:
+        self.lines += _table(header, rows, caps)
         if appendix:
             self.appendix_rows += len(rows)
         else:
@@ -188,10 +258,15 @@ class Manuscript:
                 self.placed.append(f["id"])
                 rel = self._figure_path(f["file"])
                 interp = _s(f.get("interpretation")).strip()
-                if interp:
-                    self.para(interp if FIG_REF.search(interp) else f"{{fig:{f['id']}}}: {interp}")
+                caption = _s(f.get("caption")).strip()
+                if interp and FIG_REF.search(interp):
+                    self.para(interp)          # body text that discusses the figure
+                elif interp:
+                    # a takeaway with no reference of its own belongs in the caption, as in a
+                    # journal figure legend, not as a "Figure N: …" line above the image
+                    caption = f"{caption.rstrip('.')}. {interp}" if caption else interp
                 self.lines += [f"![]({rel}){{width=100%}}", "",
-                               f"**Figure {self.fig_no[f['id']]}.** {_s(f.get('caption')).strip()}", ""]
+                               f"**Figure {self.fig_no[f['id']]}.** {caption}", ""]
 
     def sibling(self, name: str, rows: int, write: Optional[Callable[[Path], None]] = None) -> str:
         path = self.outdir / name
@@ -242,7 +317,7 @@ class Manuscript:
             f"**Review type:** {fm.get('review_type_label') or ('Scoping review' if self.kind == 'mapping' else 'Systematic review')}",
             f"**Protocol:** {self.p.get('protocol_url') or 'see Methods'} | **Registration:** {reg}",
             f"**Searches executed:** {fm.get('searches_executed') or 'NR'} | **Review id:** {self.p.get('review_id') or 'NR'}"
-            f" | **Generated:** {self.r.get('timestamp') or 'NR'}",
+            f" | **Generated:** {_s(self.r.get('timestamp'))[:10] or 'NR'}",
             f"**Unit of analysis:** {unit}",
             f"**Reading basis:** {ft} of {n_inc} included publications read in full text, {ab} on the abstract only",
         ]
@@ -294,7 +369,8 @@ class Manuscript:
         prior = self.ms.get("prior_reviews") or []
         if prior:
             self.table(["Review", "Scope", "Cutoff", "Gap this review addresses"],
-                       [[x.get("citation"), x.get("scope"), x.get("year_cutoff"), x.get("gap_addressed")] for x in prior])
+                       [[_short_cite(x.get("citation")), x.get("scope"), x.get("year_cutoff"), x.get("gap_addressed")]
+                        for x in prior])
         text = i.get("prior_reviews_text") or ""
         if prior or text:
             self.para(text or "", "introduction") if text else None
@@ -322,15 +398,17 @@ class Manuscript:
         self.h(1, "Methods")
         self.h(2, "Protocol, registration and deviations")
         self.para(f"Registration: {self.p.get('registration_number') or 'Not registered'}. "
-                  f"Deviations from the protocol: {self.p.get('amendments') or 'none'}.", "methods")
+                  f"Deviations from the protocol: {_s(self.p.get('amendments') or 'none').strip().rstrip('.')}.",
+                  "methods")
         self.h(2, "Eligibility criteria")
         inc, exc = self.p.get("inclusion_criteria") or "", self.p.get("exclusion_criteria") or ""
-        inc_l = inc if isinstance(inc, list) else [x for x in re.split(r"\n|;\s+", _s(inc)) if x.strip()]
-        exc_l = exc if isinstance(exc, list) else [x for x in re.split(r"\n|;\s+", _s(exc)) if x.strip()]
-        n = max(len(inc_l), len(exc_l))
-        if n:
-            self.table(["Inclusion", "Exclusion"],
-                       [[inc_l[k] if k < len(inc_l) else "", exc_l[k] if k < len(exc_l) else ""] for k in range(n)])
+        inc_l, exc_l = _criteria(inc), _criteria(exc)
+        if inc_l or exc_l:
+            # two lists, not a two-column table: inclusion item k has nothing to do with exclusion item k
+            for label, items in (("Inclusion criteria", inc_l), ("Exclusion criteria", exc_l)):
+                if items:
+                    self.lines += [f"**{label}.**", ""] + [f"- {x}" for x in items] + [""]
+                    self.section_words["methods"] = self.section_words.get("methods", 0) + sum(map(_words, items))
         else:
             self.para("", reason="no eligibility criteria recorded")
         self.h(2, "Information sources")
@@ -501,7 +579,7 @@ class Manuscript:
         header = ["Study", "Design", "Sample", "Population", "Outcomes", "Appraisal concern"]
         if rows:
             shown = rows if len(rows) <= INLINE_ROW_CAP else rows[:INLINE_ROW_CAP]
-            self.table(header, shown)
+            self.table(header, shown, caps=[None, 40, 30, 80, 80, None])
             if len(rows) > INLINE_ROW_CAP:
                 self.lines += [self.sibling(f"{self.stem}.characteristics.csv", len(rows),
                                             lambda p: _write_csv(p, header, rows)), ""]
@@ -513,7 +591,8 @@ class Manuscript:
         if cat:
             header = list(dict.fromkeys(k for row in cat for k in row if k != "publication_ids"))
             rows = [[row.get(k, "") for k in header] for row in cat]
-            self.table(header, rows if len(rows) <= INLINE_ROW_CAP else rows[:INLINE_ROW_CAP])
+            self.table(header, rows if len(rows) <= INLINE_ROW_CAP else rows[:INLINE_ROW_CAP],
+                       caps=[80] * len(header))
             self.lines += [self.sibling("resource_catalog.csv", len(cat),
                                         lambda p: _write_csv(p, header + ["publication_ids"],
                                                              [r + ["; ".join(map(str, c.get("publication_ids") or []))]
@@ -528,10 +607,20 @@ class Manuscript:
             for q in rqs:
                 qid = _s(q.get("question_id"))
                 self.h(2, f"{qid} — {q.get('short_title') or q.get('theme') or q.get('question')}")
-                n = self.para(authored.get(qid), f"rq:{qid}", f"no synthesis was written for {qid}")
-                self.place(f"results.rq:{qid}")
-                if n < 250:
-                    self.gate("warning", "rq-short", f"{qid} synthesis is {n} words (< 250)")
+                if _s(authored.get(qid)).strip():
+                    n = self.para(authored.get(qid), f"rq:{qid}")
+                    self.place(f"results.rq:{qid}")
+                    if n < 250:
+                        self.gate("warning", "rq-short", f"{qid} synthesis is {n} words (< 250)")
+                elif self.charted_answers(q):
+                    self.place(f"results.rq:{qid}")
+                    self.gate("warning", "rq-unsynthesised",
+                              f"{qid} shows its charted answers only: write the synthesis (pattern, "
+                              f"denominators, exemplars, NR count) in results.rq.{qid}")
+                else:
+                    self.para("", f"rq:{qid}", f"no study's answer to {qid} was charted")
+                    self.place(f"results.rq:{qid}")
+                    self.gate("warning", "rq-short", f"{qid} has no synthesis and no charted answers")
         elif themes:
             for name, text in themes.items():
                 self.h(2, f"Theme: {name}")
@@ -567,6 +656,46 @@ class Manuscript:
             if sid and pm:
                 out[sid] = pm
         return out
+
+    NR = re.compile(r"^\s*(nr|n/?a|not reported|not stated|not specified|none reported|unclear|unknown)\b", re.I)
+
+    def charted_answers(self, q: dict) -> bool:
+        """Render one question's charted answers: a factual lead and one row per study.
+
+        Used when no synthesis has been written for the question. The answers are
+        the per-study ``custom_fields`` the charting stage filled, keyed by the
+        question's id (or its text). Nothing is summarised or inferred: the lead
+        only counts, and every answer is shown as charted. Returns False when no
+        study answered.
+        """
+        qid, text = _s(q.get("question_id")), _s(q.get("question")).strip().lower()
+        arts = {_s(a.get("pmid")): a for a in self.r.get("included_articles") or []}
+        to_article = self._source_to_article()
+        rows = []
+        for rb in self.r.get("data_charting_rubrics") or []:
+            custom = rb.get("custom_fields") or {}
+            ans = next((_s(v).strip() for k, v in custom.items()
+                        if _s(k) == qid or _s(k).strip().lower() == text), "")
+            if not ans:
+                continue
+            art = arts.get(to_article.get(_s(rb.get("source_id")), ""), {})
+            first = (_s(art.get("authors") or rb.get("authors")).split(",")[0].split(";")[0].strip()
+                     or _s(rb.get("title"))[:40] or _s(rb.get("source_id")))
+            rows.append([first, _s(art.get("year") or rb.get("year")) or "n.d.", ans])
+        if not rows:
+            return False
+        n_total = len(self.r.get("included_articles") or []) or len(rows)
+        nr = sum(1 for r in rows if self.NR.match(r[2]))
+        self.para(f"{qid} asked: “{_s(q.get('question')).strip()}” Answers were charted for "
+                  f"{len(rows)} of {n_total} included studies; {nr} of those did not report it. "
+                  "The table gives each study's charted answer.", f"rq:{qid}")
+        rows.sort(key=lambda r: (bool(self.NR.match(r[2])), r[1], r[0]))
+        header = ["Study", "Year", f"Charted answer ({qid})"]
+        self.table(header, rows[:INLINE_ROW_CAP], caps=[None, None, 300])
+        safe = re.sub(r"[^\w.-]+", "-", qid) or "question"
+        self.lines += [self.sibling(f"{self.stem}.rq-{safe}.csv", len(rows),
+                                    lambda path: _write_csv(path, header, rows)), ""]
+        return True
 
     def _concern_by_study(self) -> dict[str, str]:
         """Worst domain concern per article pmid (appraisals are keyed by source_id)."""
@@ -643,7 +772,8 @@ class Manuscript:
         ready = self.ms.get("translation_readiness")
         if verdict or ready:
             label = "Evidence certainty" if self.kind == "effect" else "Maturity"
-            self.lines += [f"**{label}:** {verdict or 'NR'} | **Translation readiness:** {ready or 'NR'}", ""]
+            for name, value in ((label, verdict), ("Translation readiness", ready)):
+                self.lines += [f"**{name}.** {_strip_label(value, name) or 'NR'}", ""]
 
     def declarations(self) -> None:
         dc = self.ms.get("declarations") or {}
@@ -656,7 +786,8 @@ class Manuscript:
                 ["AI assistance", dc.get("ai_assistance") or "NR"],
                 ["Contributions", dc.get("contributions") or "NR"],
                 ["Acknowledgements", dc.get("acknowledgements") or "None"]]
-        self.table(["Item", "Statement"], rows)
+        for item, statement in rows:
+            self.para(f"**{item}.** {_s(statement).strip().rstrip('.')}.", "declarations")
 
     def references(self) -> None:
         self.h(0, "References")
@@ -715,8 +846,10 @@ class Manuscript:
         self.appraisal_table()
         self.lines += [self.sibling(f"{self.stem}.appraisal.md", len(self._appraisals())), ""]
         app("E", "Charting form")
-        items = [(_s(q.get("question_id")), _s(q.get("question"))) for q in self.p.get("research_questions") or []]
-        items += [("", _s(q)) for q in self.p.get("charting_questions") or []]
+        items = [[_s(q.get("question_id")), _s(q.get("question"))] for q in self.p.get("research_questions") or []]
+        for q in self.p.get("charting_questions") or []:
+            m = re.match(r"^\s*([A-Z]{1,3}\d{1,3})[.:)]?\s+(.*)$", _s(q), re.S)
+            items.append([m.group(1), m.group(2)] if m else ["", _s(q)])
         if items:
             self.table(["ID", "Item"], items, appendix=True)
         else:
@@ -895,7 +1028,13 @@ def main() -> int:
             man.write_text(json.dumps({"review": str(src), "figures": figures}, indent=2) + "\n", encoding="utf-8")
             print(f"drew {len(figures)} figure(s) → {man.parent}", file=sys.stderr)
 
-    style = args.references or _style_for(review.get("protocol") or {})
+    # a rebuild keeps the references list the last assembly chose (``--references cited``)
+    check_file = outdir / f"{stem}.manuscript.check.json"
+    try:
+        previous = json.loads(check_file.read_text(encoding="utf-8")).get("references") if check_file.is_file() else None
+    except (OSError, ValueError):
+        previous = None
+    style = args.references or previous or _style_for(review.get("protocol") or {})
     ref_file = outdir / f"{stem}.references.{style}.md" if style else None
 
     m = Manuscript(review, ms, figures, outdir, stem, ref_file)
@@ -906,8 +1045,9 @@ def main() -> int:
                    encoding="utf-8")
     report = {"manuscript": str(out), "body_words": m.body_words(), "word_target": m.word_target,
               "estimated_pages": round(m.estimated_pages, 1), "page_limit": m.page_limit,
-              "figures": len(m.placed), "gates": m.gates}
-    (outdir / f"{stem}.manuscript.check.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+              "figures": len(m.placed), "gates": m.gates,
+              "references": style if ref_file and ref_file.is_file() else None}
+    check_file.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     fails = [g for g in m.gates if g["level"] == "fail"]
     warns = [g for g in m.gates if g["level"] == "warning"]

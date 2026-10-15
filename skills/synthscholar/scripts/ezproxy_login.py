@@ -64,7 +64,9 @@ KNOWN_PROXIES = {
 }
 # Hostnames institutions commonly give their EZproxy, in order of preference.
 PROBE_PATTERNS = ("ezproxy.{d}", "libproxy.{d}", "ezproxy.lib.{d}", "proxy.lib.{d}",
-                  "login.ezproxy.{d}", "{stem}.idm.oclc.org")
+                  "login.ezproxy.{d}", "{stem}.idm.oclc.org", "proxy.{d}", "ezp.lib.{d}",
+                  "ezproxy.library.{d}", "login.proxy.lib.{d}")
+ROR = "https://api.ror.org/v2/organizations"
 # Personal-mail domains have no library proxy; don't probe them.
 WEBMAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
            "yahoo.com", "icloud.com", "me.com", "aol.com", "proton.me", "protonmail.com",
@@ -228,6 +230,37 @@ def host_for_domain(domain: str) -> Optional[str]:
     return next((_strip_login_prefix(c) for c, ok in zip(cands, hits) if ok), None)
 
 
+def institution_domains(name: str) -> list[tuple[str, str]]:
+    """``[(official name, domain)]`` for ONE institution, from ROR (worldwide, no key).
+
+    ROR's affiliation matcher marks a single confident match as ``chosen``:
+    "University of Oxford" → ox.ac.uk, "Technical University of Munich" → tum.de.
+    Only that match is used, never the runners-up: falling through to the next
+    candidate would sign the user in to someone else's library. No chosen
+    match (an ambiguous word such as "toronto") returns nothing.
+    """
+    try:
+        r = httpx.get(ROR, params={"affiliation": name}, timeout=15)
+        items = r.json().get("items") or [] if r.status_code == 200 else []
+    except (httpx.HTTPError, ValueError):
+        return []
+    hit = next((it for it in items if it.get("chosen")), None)
+    org = (hit or {}).get("organization") or {}
+    if not org:
+        return []
+    display = next((n.get("value") for n in org.get("names") or []
+                    if "ror_display" in (n.get("types") or [])), name)
+    doms = list(org.get("domains") or [])
+    doms += [urlparse(l.get("value", "")).hostname or "" for l in org.get("links") or []
+             if l.get("type") == "website"]
+    out: list[tuple[str, str]] = []
+    for d in doms:
+        d = _registrable(d.removeprefix("www."))
+        if d and d not in {x for _, x in out}:
+            out.append((display, d))
+    return out
+
+
 def resolve_host(proxy_host: str = "", library_link: str = "", institution: str = "") -> tuple[str, str]:
     """(host, how it was found). Raises LoginError(EXIT_NEEDS_INSTITUTION)."""
     if proxy_host:
@@ -239,16 +272,24 @@ def resolve_host(proxy_host: str = "", library_link: str = "", institution: str 
     if institution:
         dom = institution.strip().lower()
         dom = dom.split("@", 1)[1] if "@" in dom else dom
-        if "." not in dom:  # a bare name like "mit": try it as <name>.edu
-            dom = f"{dom}.edu"
-        h = host_for_domain(dom)
-        if h:
-            return h, f"institution {institution}"
+        if "." in dom and " " not in dom:          # a domain: mit.edu, ox.ac.uk
+            candidates = [(institution, dom)]
+        elif " " not in dom:                       # an acronym: "mit" → mit.edu only;
+            candidates = [(institution, f"{dom}.edu")]   # ROR matches acronyms worldwide
+        else:                                      # a full name: ROR's single chosen match
+            candidates = institution_domains(institution)
+        for display, d in candidates:
+            h = host_for_domain(d)
+            if h:
+                return h, f"institution {display} ({d})"
         # asked for a specific institution: never fall back to someone else's proxy
+        tried = ", ".join(d for _, d in candidates) or "no matching institution"
         raise LoginError(
-            f"Couldn't find a library proxy for '{institution}'. Ask the user for a link "
-            "they get when opening an article through their library, and pass it as "
-            "--library-link.", EXIT_NEEDS_INSTITUTION)
+            f"Couldn't find an EZproxy for '{institution}' (tried {tried}). Ask the user for "
+            "their institution's full name or email domain, or for a link they get when "
+            "opening an article through their library, and pass it as --library-link. "
+            "Libraries that use OpenAthens or Shibboleth instead of EZproxy are not supported.",
+            EXIT_NEEDS_INSTITUTION)
     if library_link:
         raise LoginError(f"'{library_link}' doesn't look like a library proxy link.",
                          EXIT_NEEDS_INSTITUTION)

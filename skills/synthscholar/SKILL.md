@@ -187,10 +187,13 @@ python scripts/review_figures.py out/review.json                 # out/figures/*
 python scripts/assemble_manuscript.py out/review.json --check    # out/review.manuscript.md
 python scripts/check_writing.py out/review.manuscript.md
 
-# 8. PDF — Markdown → LaTeX → PDF (the .tex is kept). Builds the manuscript,
-#    refuses past page_limit (estimated before rendering, counted after), and
-#    while out/review.citations.json has errors or is older than the review.
+# 8. PDF — Markdown → LaTeX → PDF (the .tex is kept), in the ACM journals
+#    layout (acmart acmsmall, bundled in assets/acmart/). Refuses past
+#    page_limit (estimated before rendering, counted after), and while
+#    out/review.citations.json has errors or is older than review.json.
 python scripts/generate_review_pdf.py out/review.manuscript.md
+# Existing reviews with no PDF yet (or an outdated one): find and build them all
+python scripts/generate_review_pdf.py --batch out/ ~/reviews/
 ```
 
 Step 4 needs `OPENROUTER_API_KEY` and the `synthscholar` package — it drives
@@ -313,13 +316,21 @@ Hard rules:
   resolves DOIs through Unpaywall → OpenAlex → Semantic Scholar first, which
   needs no setup; only what's left behind a paywall needs the user's library
   sign-in. **Never ask the user to set `EZPROXY_*` variables or export
-  cookies.** Run `fetch_ezproxy.py` and it signs them in itself: the first
-  time a paper isn't open access, a browser window opens at their library's
-  login. Tell them it's coming ("a browser window will open; sign in with
+  cookies.** Run `fetch_ezproxy.py` and it signs them in itself, **at the
+  start of the run**. The saved session is checked first; if there is none,
+  or it has expired, a browser window opens at their library's login before
+  any fetching. So a long run never stalls halfway, waiting on a window
+  nobody saw. A live session passes without a browser. For a long session
+  (fetching, then the review), sign in once up front with
+  `fetch_ezproxy.py --login`. `--lazy-login` restores on-demand sign-in.
+  Tell them it's coming ("a browser window will open; sign in with
   your library account"), and run the command with a long timeout (it waits
-  up to 5 minutes for them). The proxy is found from their email domain. If
-  the script exits 4, ask one question, "Which university or library do
-  you get journal access through?", and pass the answer as `--institution`.
+  up to 5 minutes for them). The proxy is found from their email domain,
+  for any university that runs EZproxy. If the script exits 4, ask one
+  question, "Which university or library do you get journal access
+  through?", and pass the answer as `--institution`. It takes the full
+  name (looked up in ROR) or the email domain. Never assume a particular
+  university.
   If it still exits 4, ask for any link their library gives when they open
   an article, and pass it as `--library-link`. Exit 3 means Playwright is
   missing: ask before installing it (dependency table below). Keep within
@@ -375,8 +386,18 @@ Hard rules:
   editing the PDF's source. It stops while `review.citations.json` reports
   errors. Pass `--allow-citation-errors` only when the user explicitly accepts
   a PDF with unresolved citations, and say so when you hand it over.
-  Needs `pandoc` and one engine (`--check-deps`). `typst` or `tectonic` from
-  conda-forge is the lightest install.
+  Needs `pandoc` and a TeX engine for the paper layout (`--check-deps`).
+  The manuscript is typeset in the **ACM journals layout** (`acmart`,
+  `acmsmall`: the class behind Overleaf's "ACM Journals Primary Article
+  Template"), with the abstract and keywords in the title block, figures as
+  numbered floats with their captions, and tables a size smaller than the text.
+  The class is bundled in `assets/acmart/` (LPPL, unmodified), so nothing is
+  fetched per build; `--layout plain` gives pandoc's article layout instead.
+  Without TeX the script falls back to typst/HTML in the plain layout and says
+  so; ask before installing TeX. When the user has earlier reviews without a
+  PDF, offer `--batch <dir>`: it finds every exported review under the folder,
+  re-assembles a stale manuscript and builds each missing or outdated PDF
+  (`--force` rebuilds all).
 - **Ingesting into BrainKB is the `brainkb` skill's job — hand off, don't
   improvise.** Its *"Ingest a SynthScholar review"* section owns the graph IRI
   (`https://brainkb.org/synthscholar/reviews/<review_id>/`, registered to a
@@ -498,7 +519,7 @@ step can't run and carry on with the rest.
 | `query_postgres.py`, `backfill_full_text.py` | `psycopg` | `python -c "import psycopg"` | `pip install "psycopg[binary]>=3.1"` |
 | `build_corpus.py` | `pymupdf`; `docling` optional | `python -c "import fitz"` | `pip install pymupdf` (+ `pip install docling` for scans/tables) |
 | `export_review.py`, `run_local_review.py`, `update_provenance.py` | `synthscholar` dev checkout | the script refuses with a message | `pip install -e /path/to/prisma-review-agent` (ask for the path) |
-| `generate_review_pdf.py` | `pandoc` + one PDF engine; `fc-list` optional | `python scripts/generate_review_pdf.py --check-deps` | `conda install -c conda-forge pandoc typst` (or `tectonic`); `brew install pandoc` / `apt-get install pandoc` without conda |
+| `generate_review_pdf.py` | `pandoc` + a **TeX engine** (xelatex, lualatex, pdflatex or tectonic) for the ACM layout; `rsvg-convert` (or `cairosvg`/`typst`) to convert SVG figures for TeX; `fc-list` optional. Without TeX: `typst` or an HTML engine, plain layout only | `python scripts/generate_review_pdf.py --check-deps` (also finds a TeX Live/MacTeX install that is not on `PATH`) | TeX: `brew install --cask mactex-no-gui` (macOS), `apt-get install texlive-xetex texlive-fonts-extra texlive-latex-extra` (Debian/Ubuntu), or `conda install -c conda-forge tectonic` (smallest; fetches packages once into its cache). Then `conda install -c conda-forge pandoc librsvg` (or `brew install pandoc librsvg`). The ACM class itself is bundled in `assets/acmart/` |
 | `validate_protocol.py`, `research_questions.py`, `check_writing.py`, `review_figures.py`, `assemble_manuscript.py` | stdlib | — | — |
 
 Network services (Crossref, PubMed, Unpaywall) and `OPENROUTER_API_KEY` are
@@ -541,7 +562,8 @@ python scripts/verify_citations.py out/review.json                     # citatio
 python scripts/verify_citations.py out/review.json --style apa --apply out/review.verified.json
 python scripts/assemble_manuscript.py out/review.json --check
 python scripts/generate_review_pdf.py out/review.manuscript.md
-python scripts/generate_review_pdf.py --check-deps                     # pandoc + engine?
+python scripts/generate_review_pdf.py --batch out/                    # PDFs for reviews that lack one
+python scripts/generate_review_pdf.py --check-deps                     # pandoc + TeX + acmart?
 
 # SPARQL over an RDF export — named recipe or your own query
 python scripts/query_sparql.py review.ttl --query included-full-text
