@@ -198,6 +198,28 @@ Notes that matter:
   and the user completes it themselves. Only the proxy's resulting session
   cookies are kept. They expire; an expired session is detected before use
   and the browser reopens, rather than the failure looking like a paywall.
+- **Reading order: the peer-reviewed version first, then fallbacks.** For
+  each paper:
+  1. the published version, through open access and then the proxy;
+  2. its registry-linked preprint, through the same two routes;
+  3. a repository-deposited copy: **Zenodo**, then **arXiv**, matched by
+     exact title *and* first author, and accepted only if it really is a
+     PDF.
+
+  The two-way registry link covers both cases: a supplied preprint DOI is
+  upgraded to its published version, and a published DOI falls back to its
+  preprint. The paper is always **cited** by its published DOI, and what was
+  actually **read** is recorded: `_read_version` (`preprint` /
+  `deposited-copy`), `_read_doi` / `_read_url`, and `_preprint_doi` when the
+  user supplied the preprint. In `--doi` mode the same facts go in the
+  manifest, which `build_corpus.py --manifest` maps back.
+- **Say what was read.** If a study was read from a preprint or a deposited
+  copy, say so in the limitations: results can differ from the published
+  version, so "full text of N studies was read from preprints or author
+  copies" belongs there.
+- **ResearchGate and Academia.edu are never queried.** Their terms forbid
+  automated access. `--no-deposits` skips step 3 and `--as-given` skips
+  version handling altogether.
 - **An open-access miss is not a failure.** Most DOIs have no free copy; that's
   normal and says nothing about the next one. Only *proxied* failures trip the
   stop-after-3 circuit breaker, because those really do indicate a dead session.
@@ -525,6 +547,21 @@ The script renders `review.md` through pandoc without changing its content:
 - `--include` appends sidecar exports as appendices, each on a new page. One
   whose title already heads a section of `review.md` is skipped: `appraisal`
   repeats the review's own *Appendix C*.
+
+**The PRISMA 2020 flow diagram is drawn and placed automatically.** It goes
+under the review's *PRISMA Flow* heading, above the counts table, which
+stays. The counts come from the review's `flow` (`<stem>.json` beside the
+Markdown, or `--flow-json`), with one line per identification source and
+per exclusion reason. `scripts/prisma_flow.py out/review.json --pdf` draws
+it on its own as an SVG and a PDF. Typst and the HTML engines embed the
+SVG; TeX engines need it converted, through rsvg-convert, cairosvg or
+typst. If none of those is installed, the build warns and omits the
+diagram; ask before installing one. `--no-flow-diagram` turns it off.
+
+**No image is cut off.** Each local image's real size is read: PNG, JPEG,
+GIF, SVG or PDF. Only one that would run past the A4 text block gets a cap:
+the text width, or 23 cm tall. Smaller images keep their natural size, and
+a width or height the author already set is never changed.
 
 Cell line breaks (`<br>`), `---` separators and the `✓ ✗ ⚠` symbols are
 rewritten for each engine, so tables keep their rows and the symbols print. On

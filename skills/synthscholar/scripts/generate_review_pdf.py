@@ -61,6 +61,9 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prisma_flow  # noqa: E402  (the PRISMA 2020 flow diagram)
+
 # Engines pandoc can drive, best first. xelatex/lualatex give proper Unicode;
 # tectonic is self-contained (fetches its own TeX packages on first run);
 # pdflatex is last among TeX engines because its Unicode handling is weakest.
@@ -109,7 +112,14 @@ RULE = re.compile(r"^ {0,3}(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$")
 # its lines is longer than --columns; review tables are long, so set it low.
 WRAP_COLUMNS = 40
 
+# A4 text block at 2 cm margins, in px at 96 dpi (pandoc's default image dpi):
+# an image larger than this is scaled down to fit instead of running off the page.
+TEXT_W_PX = 642     # 17.0 cm
+TEXT_H_PX = 870     # ~23 cm, leaving room for a caption and the running header
+IMAGE_RE = re.compile(r'!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(\s+"[^"]*")?\s*\)(\{[^}]*\})?')
+
 HTML_CSS = """
+img { max-width: 100%; height: auto; }
 body { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 10.5pt; line-height: 1.35; }
 table { border-collapse: collapse; width: 100%; font-size: 8.5pt; margin: 0.6em 0; }
 th, td { border: 1px solid #bbb; padding: 3px 5px; vertical-align: top; }
@@ -395,8 +405,129 @@ def citation_gate(md: Path, report: Optional[Path], allow: bool) -> Optional[str
     return None
 
 
+def image_size(path: Path) -> Optional[tuple[float, float]]:
+    """(width, height) in px at 96 dpi for PNG / JPEG / GIF / SVG / PDF, else None."""
+    try:
+        head = path.read_bytes()[:65536] if path.suffix.lower() != ".svg" else path.read_bytes()[:20000]
+    except OSError:
+        return None
+    if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) >= 24:
+        return float(int.from_bytes(head[16:20], "big")), float(int.from_bytes(head[20:24], "big"))
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return float(int.from_bytes(head[6:8], "little")), float(int.from_bytes(head[8:10], "little"))
+    if head[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(head):
+            if head[i] != 0xFF:
+                i += 1
+                continue
+            marker, seglen = head[i + 1], int.from_bytes(head[i + 2:i + 4], "big")
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                return float(int.from_bytes(head[i + 7:i + 9], "big")), float(int.from_bytes(head[i + 5:i + 7], "big"))
+            i += 2 + seglen
+        return None
+    if head[:4] == b"%PDF":
+        m = re.search(rb"/MediaBox\s*\[\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)", head)
+        if m:
+            x0, y0, x1, y1 = (float(v) for v in m.groups())
+            return (x1 - x0) * 96 / 72, (y1 - y0) * 96 / 72
+        return None
+    text = head.decode("utf-8", "replace")
+    if "<svg" in text:
+        tag = re.search(r"<svg\b[^>]*>", text, re.S)
+        if not tag:
+            return None
+        attrs = tag.group(0)
+
+        def length(name: str) -> Optional[float]:
+            m = re.search(rf'\b{name}\s*=\s*"([\d.]+)\s*(px|pt|mm|cm|in)?"', attrs)
+            if not m:
+                return None
+            scale = {"px": 1, None: 1, "pt": 96 / 72, "mm": 96 / 25.4, "cm": 96 / 2.54, "in": 96}
+            return float(m.group(1)) * scale[m.group(2)]
+        w, h = length("width"), length("height")
+        if w and h:
+            return w, h
+        vb = re.search(r'viewBox\s*=\s*"[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)"', attrs)
+        if vb:
+            return float(vb.group(1)), float(vb.group(2))
+    return None
+
+
+def fit_images(text: str, base_dirs: list[Path]) -> tuple[str, list[str]]:
+    """Give every local image that would overflow the page a width/height cap.
+
+    Without one, an image wider than the text block runs off the page edge in
+    TeX and Typst, and a tall one is cut at the page foot. Images that fit are
+    left at their natural size (a blanket ``width=100%`` would blow small ones
+    up); an explicit width or height the author set is never touched. Fenced
+    code is left alone.
+    """
+    notes: list[str] = []
+
+    def fix(line: str) -> str:
+        def one(m: re.Match) -> str:
+            alt, target, title, attrs = m.group(1), m.group(2), m.group(3) or "", m.group(4) or ""
+            if re.search(r"\b(width|height)\s*=", attrs) or re.match(r"^(https?:|data:)", target):
+                return m.group(0)
+            path = next((d / target for d in base_dirs if (d / target).is_file()),
+                        Path(target) if Path(target).is_absolute() else None)
+            size = image_size(path) if path else None
+            cap = ""
+            if size is None:
+                cap = "width=100%" if path else ""      # local but unreadable: fit to be safe
+            else:
+                w, h = size
+                scale = min(1.0, TEXT_W_PX / w) if w else 1.0
+                if h * scale > TEXT_H_PX:
+                    cap = f"height={TEXT_H_PX * 2.54 / 96:.1f}cm"
+                elif w > TEXT_W_PX:
+                    cap = "width=100%"
+            if not cap:
+                return m.group(0)
+            notes.append(f"fitted {Path(target).name} ({cap})")
+            inner = attrs[1:-1].strip() if attrs else ""
+            return f"![{alt}]({target}{title}){{{(inner + ' ' if inner else '') + cap}}}"
+        return IMAGE_RE.sub(one, line)
+
+    return _outside_fences(text, fix), notes
+
+
+def insert_flow_diagram(text: str, image: Path) -> tuple[str, bool]:
+    """Put the diagram right under the PRISMA flow heading (the counts table stays)."""
+    figure = f"\n![PRISMA 2020 flow diagram]({image}){{width=100%}}\n"
+    hs = headings(text)
+    target = next((i for lvl, t, i in hs if re.search(r"prisma\s+flow", t, re.I)), None)
+    if target is None:
+        target = next((i for lvl, t, i in hs if re.search(r"\bresults\b", t, re.I)), None)
+    if target is None:
+        return text, False
+    lines = text.split("\n")
+    return "\n".join(lines[:target + 1] + [figure] + lines[target + 1:]), True
+
+
+def flow_figure(md: Path, flow_json: Optional[Path], family: str, tmp: Path) -> tuple[Optional[Path], str]:
+    """(diagram file for this engine, note). SVG for Typst and HTML; PDF for TeX."""
+    src = flow_json or md.with_name(f"{md.stem}.json")
+    flow = prisma_flow.load_flow(src) if src.is_file() else None
+    if flow is None:
+        return None, (f"no flow diagram ({src.name} not found)" if not src.is_file()
+                      else f"no flow diagram ({src.name} has no PRISMA flow counts)")
+    svg = tmp / "prisma_flow.svg"
+    svg.write_text(prisma_flow.render_svg(flow), encoding="utf-8")
+    if family not in LATEX_ENGINES:
+        return svg, "PRISMA flow diagram"
+    pdf = tmp / "prisma_flow.pdf"
+    tool = prisma_flow.svg_to_pdf(svg, pdf)
+    if tool:
+        return pdf, f"PRISMA flow diagram (via {tool})"
+    return None, ("WARNING: no flow diagram — TeX engines need the SVG converted, and none of "
+                  "rsvg-convert, cairosvg or typst is installed (ask before installing one, "
+                  "e.g. `conda install -c conda-forge librsvg`; or use --pdf-engine typst)")
+
+
 def assemble(md: Path, family: str, references: Optional[str],
-             include: list[str]) -> tuple[str, Optional[str], list[str]]:
+             include: list[str], flow_image: Optional[Path] = None) -> tuple[str, Optional[str], list[str]]:
     """(Markdown for pandoc, lifted title, notes). Raises ValueError."""
     text = neutralise_rules(md.read_text(encoding="utf-8"), keep_front_matter=True)
     notes: list[str] = []
@@ -428,19 +559,28 @@ def assemble(md: Path, family: str, references: Optional[str],
         # Sidecars open with "# …": a top-level section, like the review's own.
         text += "\n" + PAGE_BREAK + "\n" + side_text + "\n"
         notes.append(f"appendix: {side.name}")
+    if flow_image is not None:
+        text, placed = insert_flow_diagram(text, flow_image)
+        if not placed:
+            notes.append("flow diagram not placed (no 'PRISMA Flow' or 'Results' heading)")
+    text, fitted = fit_images(text, [md.parent])
+    notes += fitted
     return for_engine(text, family), title, notes
 
 
 # ─────────────────────────── pandoc ────────────────────────────
 
 def build_command(src: Path, md: Path, out: Path, engine: str, *, meta: Optional[Path],
+                  extra_resources: Optional[Path] = None,
                   citeproc: bool, csl: Optional[Path], bib: Optional[Path], toc: bool,
                   number_sections: bool, template: Optional[str], declared: set[str],
                   css: Optional[Path], mainfont: Optional[str]) -> list[str]:
     family = engine_family(engine)
     cmd = ["pandoc", str(src), "-f", "markdown", "-o", str(out), f"--pdf-engine={engine}",
            # images resolve relative to the review, not to the temp copy
-           "--resource-path", f"{md.parent}{os.pathsep}.", "--standalone",
+           "--resource-path", os.pathsep.join([str(md.parent), "."]
+                                              + ([str(extra_resources)] if extra_resources else [])),
+           "--standalone",
            f"--columns={WRAP_COLUMNS}"]
     if meta:
         cmd += ["--metadata-file", str(meta)]
@@ -486,7 +626,8 @@ def generate_pdf(markdown_file: str, output_pdf: Optional[str] = None, *,
                  pdf_engine: Optional[str] = None, bibliography: Optional[str] = None,
                  citations: Optional[str] = None, allow_citation_errors: bool = False,
                  mainfont: Optional[str] = None, dry_run: bool = False,
-                 keep_source: bool = False, timeout: int = 900) -> bool:
+                 keep_source: bool = False, timeout: int = 900,
+                 flow_diagram: bool = True, flow_json: Optional[str] = None) -> bool:
     md = Path(markdown_file)
     if not md.is_file():
         print(f"Error: markdown file not found: {md}", file=sys.stderr)
@@ -515,11 +656,33 @@ def generate_pdf(markdown_file: str, output_pdf: Optional[str] = None, *,
         print(f"Error: {refusal}", file=sys.stderr)
         return False
 
+    tmpdir = tempfile.TemporaryDirectory(prefix="review-pdf-")
     try:
-        text, title, notes = assemble(md, family, references, include or [])
+        return _build(md, output_pdf, Path(tmpdir.name), engine=engine, family=family,
+                      citation_style=citation_style, references=references, include=include,
+                      template=template, toc=toc, number_sections=number_sections,
+                      bibliography=bibliography, mainfont=mainfont, dry_run=dry_run,
+                      keep_source=keep_source, timeout=timeout, flow_diagram=flow_diagram,
+                      flow_json=Path(flow_json) if flow_json else None)
+    finally:
+        tmpdir.cleanup()
+
+
+def _build(md: Path, output_pdf: Optional[str], tmp: Path, *, engine: str, family: str,
+           citation_style: str, references: Optional[str], include: Optional[list[str]],
+           template: Optional[str], toc: bool, number_sections: bool, bibliography: Optional[str],
+           mainfont: Optional[str], dry_run: bool, keep_source: bool, timeout: int,
+           flow_diagram: bool, flow_json: Optional[Path]) -> bool:
+    flow_image, flow_note = (flow_figure(md, flow_json, family, tmp) if flow_diagram
+                             else (None, ""))
+    try:
+        text, title, notes = assemble(md, family, references, include or [], flow_image)
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return False
+    if flow_note:
+        (print(f"  {flow_note}", file=sys.stderr) if flow_note.startswith("WARNING")
+         else notes.insert(0, flow_note))
 
     out = Path(output_pdf) if output_pdf else md.with_suffix(".pdf")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -553,20 +716,20 @@ def generate_pdf(markdown_file: str, output_pdf: Optional[str] = None, *,
     if mainfont and family in UNICODE_TEX:
         notes.append(f"font: {mainfont}")
 
-    with tempfile.TemporaryDirectory(prefix="review-pdf-") as tmp:
-        src = Path(tmp) / f"{md.stem}.pandoc.md"
+    if True:   # the build runs inside the caller's temporary directory
+        src = tmp / f"{md.stem}.pandoc.md"
         src.write_text(text, encoding="utf-8")
         meta = None
         if title:
             # A metadata file, not --metadata title=…: a title with a colon would
             # be read as YAML structure on the command line. JSON strings are YAML.
-            meta = Path(tmp) / "meta.yaml"
+            meta = tmp / "meta.yaml"
             meta.write_text(f"title: {json.dumps(title, ensure_ascii=False)}\n", encoding="utf-8")
         css = None
         if family in HTML_ENGINES:
-            css = Path(tmp) / "review.css"
+            css = tmp / "review.css"
             css.write_text(HTML_CSS, encoding="utf-8")
-        cmd = build_command(src, md, out, engine, meta=meta, citeproc=citeproc, csl=csl, bib=bib,
+        cmd = build_command(src, md, out, engine, meta=meta, extra_resources=tmp, citeproc=citeproc, csl=csl, bib=bib,
                             toc=toc, number_sections=number_sections, template=template,
                             declared=declared, css=css, mainfont=mainfont)
         if keep_source:
@@ -625,6 +788,16 @@ def check_dependencies() -> bool:
         print(f"[ok] {e}")
     if not found:
         print("[MISSING] no PDF engine (tried: " + ", ".join(ALL_ENGINES) + ")")
+    if any(e in LATEX_ENGINES for e in found):
+        conv = next((c for c in ("rsvg-convert", "typst") if shutil.which(c)), None)
+        if not conv:
+            try:
+                import cairosvg  # type: ignore  # noqa: F401
+                conv = "cairosvg"
+            except Exception:
+                pass
+        print(f"[{'ok' if conv else '--'}] SVG→PDF for the flow diagram on TeX engines"
+              + (f" ({conv})" if conv else ": rsvg-convert, cairosvg or typst"))
     if any(e in UNICODE_TEX for e in found):
         print(f"[{'ok' if shutil.which('fc-list') else '--'}] fc-list "
               "(picks a Unicode font for TeX engines; optional)")
@@ -657,6 +830,10 @@ def main() -> int:
     p.add_argument("--no-toc", action="store_true")
     p.add_argument("--number-sections", action="store_true",
                    help="pandoc section numbers (off: the review numbers its own)")
+    p.add_argument("--no-flow-diagram", action="store_true",
+                   help="don't draw the PRISMA 2020 flow diagram under the PRISMA Flow heading")
+    p.add_argument("--flow-json", metavar="REVIEW_JSON",
+                   help="review JSON with the flow counts (default: <stem>.json beside the Markdown)")
     p.add_argument("--keep-source", action="store_true",
                    help="also write the Markdown pandoc reads, next to the PDF")
     p.add_argument("--dry-run", action="store_true", help="print the pandoc command and stop")
@@ -674,7 +851,8 @@ def main() -> int:
                       pdf_engine=args.pdf_engine, bibliography=args.bibliography,
                       citations=args.citations, allow_citation_errors=args.allow_citation_errors,
                       mainfont=args.mainfont, dry_run=args.dry_run,
-                      keep_source=args.keep_source, timeout=args.timeout)
+                      keep_source=args.keep_source, timeout=args.timeout,
+                      flow_diagram=not args.no_flow_diagram, flow_json=args.flow_json)
     return 0 if ok else 1
 
 

@@ -92,7 +92,11 @@ reference.** Fix the reference from the registry, or remove the claim.
 | `doi-from-pubmed` | info | DOI filled from a verified PMID | applied by `--apply` |
 | `update-correction` etc. | info | a correction exists | no action; corrections do not invalidate a study |
 | `doi-year-offby1` | info | online vs print year | no action |
-| `preprint-published` | info | cited preprint has a published version | consider citing the version of record |
+| `preprint-has-published-version` | warning | the cited preprint has a registry-linked peer-reviewed version (the journal article's `has-preprint`, or the preprint's `is-preprint-of`) | cite the published version (`--apply` switches DOI, journal, year, title), then **re-check the extracted numbers against the published text**: results can change in peer review |
+| `preprint-published-candidate` | warning | a journal article matches the preprint by title, first author and year, but no registry link exists | confirm it is the same work, then cite it. Never applied automatically |
+| `preprint-only` | info | a preprint with no peer-reviewed version found | keep it, labelled; state in the limitations that it is not peer-reviewed |
+| `pmid-found` | info | PubMed has the article (looked up by DOI, title confirmed) | `--apply` records the PMID |
+| `duplicate-study` | error | two included entries are one work (a preprint and its published version) | one study counted twice: keep the published one, exclude the other, correct the PRISMA counts. Neither entry is switched |
 | `uncited-included` | info | included but never cited in the prose | expected for some; many of them means the synthesis ignores part of the corpus |
 
 ## `--apply`: what it changes, and what it never does
@@ -105,9 +109,17 @@ registry-confirmed changes:
   title matched (≥ 0.90). With no title in the review, only when the record's
   first author **and** year both agree: a hallucinated DOI still resolves to
   some real paper;
-- a missing DOI filled from PubMed for a PMID whose title matched.
+- a missing DOI filled from PubMed for a PMID whose title matched;
+- **a cited preprint switched to its peer-reviewed version** when the registry
+  links the two (DOI, journal, year and title from the published record);
+- **the PMID recorded** wherever PubMed has the article. The PMID is the
+  article's id across the review, so the old id (`local_…`, or a preprint's
+  PMID) is rewritten everywhere it appears: the screening log, evidence
+  spans, rubrics, per-group lists and `PMID:` citations in the prose. The
+  `references_updated` count is in `applied`, and the RDF IRIs change with it.
 
-It never applies a `doi-candidate`, never overwrites a non-empty field that
+It never applies a `doi-candidate` or a `preprint-published-candidate`, never
+switches an entry flagged `duplicate-study`, never overwrites a non-empty field that
 disagrees with the registry (that is a finding for you to judge), and never
 touches the prose. Each change is listed under `applied` in the JSON report.
 

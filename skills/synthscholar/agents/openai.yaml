@@ -59,6 +59,7 @@ dependencies:
     update_provenance.py: "synthscholar (models only)"
     check_writing.py: "stdlib only"
     verify_citations.py: "httpx; Crossref, doi.org, NCBI E-utilities — no credentials"
+    prisma_flow.py: "stdlib for the SVG; rsvg-convert, cairosvg or typst for the PDF a TeX engine embeds"
     generate_review_pdf.py: "pandoc + one engine (xelatex, lualatex, tectonic, pdflatex, typst, weasyprint, wkhtmltopdf, prince); stdlib otherwise"
     query_sparql.py: "rdflib"
     query_postgres.py: "psycopg[binary]"

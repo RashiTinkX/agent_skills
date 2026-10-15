@@ -179,7 +179,9 @@ python scripts/export_review.py out/review.verified.json --outdir out/ --formats
 python scripts/verify_citations.py out/review.json --style vancouver
 
 # 7. PDF (optional) — refuses while out/review.citations.json has errors or
-#    is older than out/review.md
+#    is older than out/review.md. Draws the PRISMA 2020 flow diagram from
+#    out/review.json under the PRISMA Flow heading, and fits every image to
+#    the page.
 python scripts/generate_review_pdf.py out/review.md --references vancouver \
     --include charting per-group citations
 ```
@@ -212,6 +214,31 @@ python scripts/research_questions.py out/review.json --outdir out/ --themes them
 - **Complete the corpus metadata yourself** from each entry's `_head_text` —
   don't hand the user a list of fields to fill. Never invent a DOI or year;
   leave it empty instead.
+- **Identify every paper by its published version, with its PMID.** These
+  rules apply to the reference list, in-text citations and fetching alike:
+  - **Cite the peer-reviewed version.** When a study exists as both a
+    preprint and a peer-reviewed article, cite, fetch and read the
+    peer-reviewed article. Its venue DOI is the article's DOI.
+  - **Add the PubMed ID wherever PubMed has the article.**
+  - **Read the published version where possible.** If neither open access
+    nor the proxy can reach it, read its preprint, then a copy deposited on
+    Zenodo or arXiv, but still cite the published DOI. Say in the
+    limitations which studies were read from a preprint or a deposited
+    copy. ResearchGate and Academia.edu are never used.
+  - **Cite a preprint only when no peer-reviewed version exists.** Label it
+    as a preprint, and say in the limitations that it is not peer-reviewed.
+
+  The scripts do this:
+  - `fetch_ezproxy.py` tries the published version first.
+  - `verify_citations.py` reports a preprint with a published version,
+    adds missing PMIDs, and `--apply` makes both changes, rewriting the
+    article's id everywhere it appears in the review.
+  - The styled reference list ends each entry with its PMID.
+
+  A switched version may report different numbers: re-check the extracted
+  results against the published text. A preprint and its published version
+  are one study, and including both is an error: exclude one and correct
+  the PRISMA counts.
 - **Ask for the search strategy, but never block on it.** Databases, exact
   query strings, dates searched, filters, records identified, duplicates
   removed — ask as one batch of structured questions. If the user doesn't have
@@ -356,6 +383,7 @@ parity: `slr:content_hash` in RDF equals `article_full_text.content_sha256`.
 - **Audit provenance** — which resolver produced each full text (`pmc_oa`,
   `europe_pmc_oa`, `unpaywall_pdf`, `biorxiv_pdf`, `openalex_pdf`,
   `semanticscholar_pdf`, `ezproxy_pdf` — institutional subscription access —
+  `zenodo_pdf`, `arxiv_pdf` — deposited copies, the last resort —
   `user_supplied_pdf`, `article_store`, `cache`) and when.
 - **Ask what the review actually read** — how many reports were retrieved vs
   not, how many eligibility decisions were made on full text vs abstract only,
