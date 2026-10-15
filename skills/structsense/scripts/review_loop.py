@@ -121,7 +121,7 @@ def abcd_records(doc: dict) -> list[dict]:
                        "construct": item.get("construct"),
                        "model": item.get("specification") or item.get("model_id"),
                        "finding": item.get("statement")}[kind]
-            iid = item.get("review_id") or rid(kind[:3], surface, ev.get("start"), ev.get("quote", "")[:80])
+            iid = item.get("review_id") or rid(kind[:3], surface, ev.get("start"), (ev.get("quote") or "")[:80])
             item["review_id"] = iid
             mapping = None
             if kind == "variable" and item.get("dictionary_match"):
@@ -523,6 +523,13 @@ class Applier:
                                                                       "ait_hierarchy_level", "skos_relation", "cl_id")
                                                if value.get(k)})
             return {"from": ref.get("ait_node_id"), "to": value["ait_node_id"], "new_mapping_id": new["mapping_id"]}
+        if self.mode == "ait" and rec["kind"] == "entity":
+            # An entity row holds no ontology id; its mapping lives in its concept
+            # row (or its AIT edges). Writing one here would land in entities.csv.
+            raise OpError("an AIT entity has no mapping of its own: remap its concept row "
+                          f"(concept_id in {CONCEPT_TABLE}) or its AIT edge (mapping_id); "
+                          "if the entity was dropped and restored, its concept row is gone — "
+                          "re-run the concept map stage (review_loop map --mode ait)")
         query = value if isinstance(value, str) else (value or {}).get("query")
         if not query or not str(query).strip():
             raise OpError("remap needs a query string: the tool decides the id")

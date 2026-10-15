@@ -95,7 +95,12 @@ DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+")
 DOI_FORM = re.compile(r"^10\.\d{4,9}/\S+$")
 URL_RE = re.compile(r"https?://[^\s<>)\]\"'|]+")
 # "PMID: 123", "PMID:123", "PMIDs: 1, 2", "PMID local_ab12cd34"
-PMID_RE = re.compile(r"\bPMIDs?\s*[:#]?\s*((?:(?:local_[0-9a-f]+|\d{1,9})(?:\s*(?:,|and|&)\s*)?)+)",
+# A list continues only with PMID-shaped ids (``local_…`` or 5+ digits), so a
+# year or count after a comma — "(PMID: 31234567, 2019 cohort)" — is not taken
+# for a second PMID. PMIDs under 10000 date from the 1970s; list them each with
+# their own "PMID:" if a review really cites one.
+PMID_RE = re.compile(r"\bPMIDs?\s*[:#]?\s*((?:local_[0-9a-f]+|\d{1,9})\b"
+                     r"(?:\s*(?:,|and|&)\s*(?:local_[0-9a-f]+|\d{5,9})\b)*)",
                      re.IGNORECASE)
 PMID_ID = re.compile(r"local_[0-9a-f]+|\d{1,9}", re.IGNORECASE)
 REAL_PMID = re.compile(r"^\d{1,9}$")
@@ -133,6 +138,10 @@ NON_PROSE = {
     "timestamp", "grounding_validation", "cache_hit", "cache_similarity_score",
 }
 STRUCTURED_ID_KEYS = {"paper_pmid", "pmid"}  # plus any key ending in "_pmids"
+# Fields holding text quoted verbatim from the source papers. Citations inside
+# a quote belong to the quoted paper's own reference list, so only the
+# structured id fields under these are checked.
+QUOTED = {"evidence_spans"}
 
 SEVERITY_RANK = {"info": 0, "warning": 1, "error": 2}
 
@@ -262,7 +271,10 @@ class Registry:
         if r is None:
             return "error", {"detail": "Crossref unreachable"}
         if r.status_code == 200:
-            meta = parse_crossref(r.json().get("message", {}))
+            body = _json(r)
+            if body is None:
+                return "error", {"detail": "Crossref returned a non-JSON response"}
+            meta = parse_crossref(body.get("message") or {})
             if check_updates:
                 meta["updates"] = _merge_updates(meta["updates"], self._notices_for(doi))
             return "crossref", meta
@@ -277,11 +289,9 @@ class Registry:
             return "not-found", {}
         c = self._get(DOI_RESOLVER + quote(doi, safe="/"),
                       headers={"Accept": "application/vnd.citationstyles.csl+json"})
-        if c is not None and c.status_code == 200:
-            try:
-                return "other-registry", parse_csl(c.json())
-            except ValueError:
-                pass
+        csl = _json(c) if c is not None and c.status_code == 200 else None
+        if csl is not None:
+            return "other-registry", parse_csl(csl)
         return "other-registry", {"doi": doi}
 
     def _notices_for(self, doi: str) -> list[dict]:
@@ -290,10 +300,11 @@ class Registry:
             {"filter": f"updates:{doi}", "rows": 20,
              "select": "DOI,type,update-to,title"}))
         time.sleep(self.delay)
-        if r is None or r.status_code != 200:
+        body = _json(r) if r is not None and r.status_code == 200 else None
+        if body is None:
             return []
         out = []
-        for item in r.json().get("message", {}).get("items", []):
+        for item in (body.get("message") or {}).get("items") or []:
             for u in item.get("update-to") or []:
                 if clean_doi(u.get("DOI", "")).lower() == doi.lower():
                     out.append({"type": (u.get("type") or "").lower(),
@@ -311,10 +322,11 @@ class Registry:
             {"query.bibliographic": q, "rows": 3,
              "select": "DOI,title,author,issued,container-title,type"}))
         time.sleep(self.delay)
-        if r is None or r.status_code != 200:
+        body = _json(r) if r is not None and r.status_code == 200 else None
+        if body is None:
             return []
         cands = []
-        for item in r.json().get("message", {}).get("items", []):
+        for item in (body.get("message") or {}).get("items") or []:
             m = parse_crossref(item)
             fam = m["authors"][0][0] if m["authors"] else ""
             cands.append({"doi": m["doi"], "title": m["title"], "year": m["year"],
@@ -338,9 +350,10 @@ class Registry:
                 params["api_key"] = self.ncbi_key
             r = self._get(ESUMMARY, params)
             time.sleep(0.12 if self.ncbi_key else 0.4)
-            if r is None or r.status_code != 200:
-                continue
-            res = r.json().get("result", {})
+            body = _json(r) if r is not None and r.status_code == 200 else None
+            if body is None:
+                continue  # these PMIDs stay absent → reported as lookup-failed
+            res = body.get("result") or {}
             for pmid in batch:
                 rec = res.get(pmid)
                 out[pmid] = None if (not rec or rec.get("error")) else parse_pubmed(rec)
@@ -358,6 +371,15 @@ class Registry:
         except httpx.HTTPError:
             return False, 0
         return r.status_code < 400, r.status_code
+
+
+def _json(r: httpx.Response) -> Optional[dict]:
+    """Response body as a JSON object, or None for an HTML error page and the like."""
+    try:
+        body = r.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
 
 
 def _retry_after(value: Optional[str], default: float) -> float:
@@ -556,18 +578,28 @@ def check_pubmed_record(claimed: dict, pm: dict) -> list[dict]:
 
 # ─────────────────────────── in-text citations ────────────────────────────
 
-def walk_prose(node: Any, path: str = "") -> Iterable[tuple[str, str, Any]]:
-    """Yield (path, key, value) for every leaf of the generated review."""
+def _is_id_key(key: str) -> bool:
+    return key in STRUCTURED_ID_KEYS or key.endswith("_pmids")
+
+
+def walk_prose(node: Any, path: str = "", quoted: bool = False) -> Iterable[tuple[str, str, Any]]:
+    """Yield (path, key, value) for every leaf of the generated review.
+
+    Under a ``QUOTED`` field only the structured id leaves are yielded.
+    """
     if isinstance(node, dict):
         for k, v in node.items():
             if not path and k in NON_PROSE:
                 continue
-            yield from walk_prose(v, f"{path}.{k}" if path else k)
+            yield from walk_prose(v, f"{path}.{k}" if path else k,
+                                  quoted or (not path and k in QUOTED))
     elif isinstance(node, list):
         for i, v in enumerate(node):
-            yield from walk_prose(v, f"{path}[{i}]")
+            yield from walk_prose(v, f"{path}[{i}]", quoted)
     else:
-        yield path, path.rsplit(".", 1)[-1].split("[")[0], node
+        key = path.rsplit(".", 1)[-1].split("[")[0]
+        if not quoted or _is_id_key(key):
+            yield path, key, node
 
 
 def snippet(text: str, start: int, end: int, pad: int = 60) -> str:
@@ -675,11 +707,15 @@ class Verifier:
 
     @staticmethod
     def _claimed(a: dict) -> dict:
-        pmid = str(a.get("pmid") or "").strip()
-        return {"key": pmid or clean_doi(a.get("doi", "")) or a.get("title", "")[:40],
-                "pmid": pmid, "doi": str(a.get("doi") or ""),
-                "title": a.get("title") or "", "authors": a.get("authors") or "",
-                "year": str(a.get("year") or ""), "journal": a.get("journal") or ""}
+        def text(field: str) -> str:
+            v = a.get(field)
+            return "" if v is None else str(v)
+
+        pmid = text("pmid").strip()
+        return {"key": pmid or clean_doi(text("doi")) or text("title")[:40],
+                "pmid": pmid, "doi": text("doi"), "title": text("title"),
+                "authors": text("authors"), "year": text("year"),
+                "journal": text("journal")}
 
     def _verify_reference(self, c: dict, pubmed: dict) -> dict:
         findings: list[dict] = []
@@ -688,13 +724,13 @@ class Verifier:
 
         raw = c["doi"].strip()
         doi = clean_doi(raw)
-        if raw and doi != raw:
+        if doi and not DOI_FORM.match(doi):
+            findings.append(finding("doi-invalid", "error", f"“{raw}” is not a DOI"))
+            doi = ""
+        elif raw and doi != raw:
             findings.append(finding("doi-malformed", "warning",
                                     f"DOI field holds “{raw}”; the bare form is {doi}"))
             rec["suggested"]["doi"] = doi
-        if doi and not DOI_FORM.match(doi):
-            findings.append(finding("doi-invalid", "error", f"“{doi}” is not a DOI"))
-            doi = ""
         rec["doi"] = doi
 
         if self.reg is None:
@@ -732,7 +768,7 @@ class Verifier:
             else:
                 rec["registry"] = meta
                 findings += check_registry_record(c, meta)
-                if meta.get("title_similarity", 0) >= TITLE_MATCH or (not c["title"] and meta.get("title")):
+                if _record_confirmed(c, meta):
                     rec["suggested"].update(_fill_empty(c, meta))
         elif not c["pmid"] or not REAL_PMID.match(c["pmid"]) or rec["pubmed"] is None:
             findings.append(finding("doi-missing", "warning",
@@ -767,7 +803,7 @@ class Verifier:
         cited: set[str] = set()
 
         for path, key, value in walk_prose(review):
-            if (key in STRUCTURED_ID_KEYS or key.endswith("_pmids")) and isinstance(value, (str, int)):
+            if _is_id_key(key) and isinstance(value, (str, int)):
                 ids = [str(value).lower()]
                 cites = [{"kind": "pmid", "id": i, "snippet": f"{key} = {value}"} for i in ids if i]
             elif isinstance(value, str) and len(value) > 3:
@@ -880,6 +916,21 @@ class Verifier:
                         f"“{ct['surname']} {ct['year']}” matches no reference-list entry"),
                         "location": "body", "snippet": ct["snippet"]})
         return report
+
+
+def _record_confirmed(c: dict, meta: dict) -> bool:
+    """Whether a registry record is shown to be *this* article.
+
+    A matching title suffices. With no title in the review there is nothing to
+    match, and a hallucinated DOI resolves to some real paper all the same, so
+    the record must instead agree on both first author and year.
+    """
+    if c["title"]:
+        return meta.get("title_similarity", 0) >= TITLE_MATCH
+    fam = meta["authors"][0][0] if meta.get("authors") else ""
+    cy = first_year(c["year"])
+    return bool(fam and surname_matches(fam, c["authors"]) and cy and meta.get("years")
+                and min(abs(cy - y) for y in meta["years"]) <= 1)
 
 
 def _fill_empty(c: dict, meta: dict) -> dict:

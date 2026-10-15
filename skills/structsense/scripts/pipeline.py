@@ -419,6 +419,22 @@ def judge(aligned: dict, source_text: str, *, model: str,
 # Driver
 # ---------------------------------------------------------------------------
 
+def concept_mapper(mapper_backend: str, local_mapping_url: str = "http://localhost:8000",
+                   ask_user: Optional[Callable[[str], Optional[str]]] = None):
+    """The stage-2 ConceptMapper for a --mapper / --mapper-url choice.
+
+    Shared with the human-feedback step so a reviewer's remap queries the same
+    sources the extraction was mapped with.
+    """
+    from concept_mapping import ConceptMapper
+    named = {"local": "local_hybrid", "local_hybrid": "local_hybrid", "ols": "ols",
+             "bioportal": "bioportal"}
+    if mapper_backend != "config" and mapper_backend not in named:
+        raise ValueError(f"unknown mapper backend: {mapper_backend!r}")
+    sources = None if mapper_backend == "config" else ["trusted", named[mapper_backend]]
+    return ConceptMapper(sources=sources, local_url=local_mapping_url, ask_user=ask_user)
+
+
 def run(text: str, *, task: str, extractor_model: str,
         mapper_backend: Optional[str], judge_model: Optional[str],
         chunk_size: int = 2000, max_workers: int = 8,
@@ -497,13 +513,8 @@ def run(text: str, *, task: str, extractor_model: str,
         # concept_mapping.json's sources_priority (trusted -> local hybrid -> OLS MCP ->
         # BioPortal); a named backend is trusted -> that backend.
         t0 = time.monotonic()
-        from concept_mapping import ConceptMapper, map_result
-        named = {"local": "local_hybrid", "local_hybrid": "local_hybrid", "ols": "ols",
-                 "bioportal": "bioportal"}
-        if mapper_backend != "config" and mapper_backend not in named:
-            raise ValueError(f"unknown mapper backend: {mapper_backend!r}")
-        sources = None if mapper_backend == "config" else ["trusted", named[mapper_backend]]
-        cm = ConceptMapper(sources=sources, local_url=local_mapping_url, ask_user=ask_user)
+        from concept_mapping import map_result
+        cm = concept_mapper(mapper_backend, local_mapping_url, ask_user)
         if not cm.usable_sources():
             raise RuntimeError("concept mapping is mandatory and tool-only (rule 15), and no source in "
                                f"{cm.sources} is usable: index the trusted ontologies (python -m "
@@ -794,7 +805,10 @@ def _main():
         if args.task == "ner" and (args.feedback or args.human_feedback == "interactive"):
             import human_feedback as hf
             import review_loop as rl
-            tools = rl.Tools()
+            # Remaps go through the mapper stage 2 used, not the default cascade.
+            tools = rl.Tools(mapper=concept_mapper(mapper, args.mapper_url,
+                                                   None if args.non_interactive else _stdin_ask)
+                             if mapper else None)
             if args.feedback:
                 spec = json.loads(Path(args.feedback).read_text())
                 for e in hf.apply_feedback("ner", result, (spec.get("ops") if isinstance(spec, dict) else spec) or [],
