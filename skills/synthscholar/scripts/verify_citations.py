@@ -305,7 +305,7 @@ class Registry:
     def search_bibliographic(self, title: str, authors: str, year: str) -> list[dict]:
         """Top Crossref matches for a citation that has no DOI."""
         q = " ".join(x for x in (title, first_author_segment(authors), year) if x)
-        if len(norm_text(title)) < 15:
+        if len(norm_text(title)) < 5:
             return []
         r = self._get(CROSSREF, self._crossref_params(
             {"query.bibliographic": q, "rows": 3,
@@ -316,8 +316,10 @@ class Registry:
         cands = []
         for item in r.json().get("message", {}).get("items", []):
             m = parse_crossref(item)
+            fam = m["authors"][0][0] if m["authors"] else ""
             cands.append({"doi": m["doi"], "title": m["title"], "year": m["year"],
-                          "first_author": m["authors"][0][0] if m["authors"] else "",
+                          "first_author": fam,
+                          "author_match": bool(fam) and surname_matches(fam, authors),
                           "title_similarity": round(title_similarity(title, m["title"]), 3)})
         return sorted(cands, key=lambda c: -c["title_similarity"])
 
@@ -738,8 +740,13 @@ class Verifier:
 
         if (not doi or any(f["code"] == "doi-title-mismatch" for f in findings)) \
                 and self.search_missing and c["title"]:
+            # A candidate needs the title *and* the first author to agree: short
+            # titles ("Deep learning") are shared by many unrelated papers.
             cands = [x for x in self.reg.search_bibliographic(c["title"], c["authors"], c["year"])
-                     if x["title_similarity"] >= TITLE_MATCH and x["doi"].lower() != doi.lower()]
+                     if x["title_similarity"] >= TITLE_MATCH and x["author_match"]
+                     and (not first_year(c["year"]) or not x["year"]
+                          or abs(first_year(c["year"]) - x["year"]) <= 1)
+                     and x["doi"].lower() != doi.lower()]
             rec["candidates"] = cands
             if cands:
                 findings.append(finding("doi-candidate", "info",
@@ -943,7 +950,7 @@ def _authors_style(authors: list[tuple[str, str]], style: str) -> str:
         return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " & " + names[-1]
     if style == "vancouver":
         names = [f"{f} {_initials(g, '').replace(' ', '')}".strip() for f, g in authors]
-        return ", ".join(names[:6]) + (", et al." if len(names) > 6 else "")
+        return ", ".join(names[:6]) + (", et al" if len(names) > 6 else "")
     if style == "ieee":
         names = [f"{_initials(g)} {f}".strip() for f, g in authors]
         if len(names) > 6:
@@ -1042,7 +1049,7 @@ def render_markdown(report: dict, source: str) -> str:
                 if f["severity"] != "info"]
     if ref_rows:
         out += ["## Reference metadata\n"] + table(ref_rows)
-    txt_rows = [(f["severity"], f"`{f['location']}`", f"{f['message']}<br>…{f['snippet']}")
+    txt_rows = [(f["severity"], f"`{f['location']}`", f"{f['message']}<br>{f['snippet']}")
                 for f in sorted(report["in_text"], key=rank)]
     if txt_rows:
         out += ["## In-text citations\n"] + table(txt_rows)

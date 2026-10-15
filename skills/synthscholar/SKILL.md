@@ -1,6 +1,6 @@
 ---
 name: synthscholar
-version: 0.3.0
+version: 0.4.0
 description: Set up, run, and query SynthScholar / PRISMA systematic reviews. (1) Protocol intake — draft a complete protocol (research question, PICO, eligibility, databases, risk-of-bias tool, charting, per-group analysis, registration) and validate it before a run. (2) Provenance queries over a finished review — full-text vs abstract-only inclusions, retrieval routes, and the screening audit trail (decisions on full text vs abstract, exclusion reasons per stage), via SPARQL over the RDF export or SQL over the article store. (3) Bring-your-own-corpus review — the user supplies PDFs, or DOIs whose full text is fetched open access (Unpaywall, OpenAlex, Semantic Scholar) then via their own institutional EZproxy access; produces the full PRISMA review (screening, charting, appraisal, synthesis) as Markdown and SLR-ontology Turtle. Use when asked to start or scope a review, run a review over supplied PDFs, get full text for a DOI, export a review to md/ttl, or audit full-text and screening provenance.
 license: Apache-2.0
 ---
@@ -163,6 +163,10 @@ python scripts/run_local_review.py --protocol protocol.json --corpus corpus.json
 # 5. Provenance added late (if the user didn't have it in step 3)
 python scripts/update_provenance.py out/review.json \
     --provenance search_provenance.json --outdir out/
+
+# 6. Citations — gate before handing the review over (exit 1 on errors)
+python scripts/verify_citations.py out/review.json
+python scripts/verify_citations.py out/review.json --apply out/review.verified.json
 ```
 
 Step 4 needs `OPENROUTER_API_KEY` and the `synthscholar` package — it drives
@@ -227,6 +231,18 @@ python scripts/research_questions.py out/review.json --outdir out/ --themes them
   question IRIs. Never hand-assemble that view or paste the answers into the
   synthesis: it is generated, and a hand-made copy goes stale on the next
   export.
+- **Verify citations before handing the review over.** Run
+  `verify_citations.py` on `review.json` after every export. It resolves each
+  included article's DOI and PMID against Crossref / DataCite / PubMed, compares
+  the registered title, author and year with the review's, flags retractions,
+  and checks that every PMID, DOI and author–year citation in the generated
+  prose belongs to an included study. Clear the errors before ingesting. Fix
+  references from the registry (`--apply` does the registry-confirmed ones),
+  remove or re-attribute claims that cite excluded or unknown studies, and tell
+  the user about retracted studies rather than dropping them silently. Never
+  make a citation pass by inventing a DOI or by adopting a `doi-candidate`
+  the user hasn't confirmed. Finding codes and the response to each:
+  [references/citation_verification.md](references/citation_verification.md).
 - **Always offer both exports.** `.md` to read, `.ttl` to ingest.
 - **Ingesting into BrainKB is the `brainkb` skill's job — hand off, don't
   improvise.** Its *"Ingest a SynthScholar review"* section owns the graph IRI
@@ -272,6 +288,10 @@ parity: `slr:content_hash` in RDF equals `article_full_text.content_sha256`.
 - Wants an existing review **exported to Markdown or Turtle**, or the **TTL
   ingested** into a triple store / BrainKB.
 - Wants to **add or correct the search strategy** on a review that already ran.
+- Wants the **citations of a review (or any Markdown manuscript) verified**:
+  DOIs/PMIDs real and pointing at the cited paper, retractions, in-text
+  citations matching the included studies, or a reference list in APA /
+  Nature / Vancouver / IEEE.
 
 **Queries (Mode 2)** — when the user asks to:
 
@@ -335,7 +355,7 @@ and uses the PyMuPDF chain, and `--no-docling` skips it deliberately.
 not the released package** — `pip install -e /path/to/prisma-review-agent`. The
 PyPI build predates the whole-document reading and screening-basis provenance,
 and they refuse to run on it rather than silently dropping those fields.
-`fetch_ezproxy.py` works anywhere — it needs only `httpx`, since the skill
+`fetch_ezproxy.py` and `verify_citations.py` work anywhere — they need only `httpx`, since the skill
 vendors both `scripts/oa_client.py` (the open-access DOI chain) and
 `scripts/ezproxy_client.py` (`synthscholar.ezproxy` ships only in the checkout).
 
@@ -354,6 +374,8 @@ python scripts/run_local_review.py --protocol protocol.json --corpus corpus.json
 python scripts/export_review.py out/review.json --outdir out/ --formats md ttl
 python scripts/research_questions.py out/review.json --outdir out/   # retrofit only
 python scripts/update_provenance.py out/review.json --provenance search_provenance.json
+python scripts/verify_citations.py out/review.json                     # citation gate
+python scripts/verify_citations.py out/review.json --style apa --apply out/review.verified.json
 
 # SPARQL over an RDF export — named recipe or your own query
 python scripts/query_sparql.py review.ttl --query included-full-text
@@ -380,6 +402,9 @@ scripts) to see every named recipe.
 - [references/byo_corpus_review.md](references/byo_corpus_review.md) —
   bring-your-own-corpus workflow: corpus schema, search-provenance intake,
   PRISMA-flow accounting, the two execution paths, exports and ingestion.
+- [references/citation_verification.md](references/citation_verification.md) —
+  what `verify_citations.py` checks, every finding code with the action it
+  calls for, `--apply` semantics, and the reference styles.
 - [references/sparql_queries.md](references/sparql_queries.md) — SPARQL recipe catalog.
 - [references/sql_queries.md](references/sql_queries.md) — SQL recipe catalog.
 - [references/data_model.md](references/data_model.md) — the SLR-ontology terms

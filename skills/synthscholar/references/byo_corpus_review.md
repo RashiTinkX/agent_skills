@@ -458,6 +458,25 @@ python scripts/research_questions.py out/review.json --outdir out/ --themes them
 no switch to turn the view off: a review that declares no research questions
 gets no appendix, no block and no question nodes.
 
+### Citation verification
+
+Run before ingesting, and again after any re-export:
+
+```bash
+python scripts/verify_citations.py out/review.json                 # exit 1 on errors
+python scripts/verify_citations.py out/review.json --apply out/review.verified.json
+python scripts/export_review.py out/review.verified.json --outdir out/ --formats md ttl json
+```
+
+It resolves every included article's DOI (Crossref, then DataCite / other
+agencies) and PMID (PubMed), compares the registered title, first author and
+year with the corpus metadata, and looks up retraction notices from the paper's
+side. It also checks every `PMID:` / DOI / author–year citation in the generated
+text against the included set and the screening log. A BYO corpus is exposed
+here in particular: its DOIs were read off PDF headers by `build_corpus.py`
+and completed by hand. Finding codes, actions, and what `--apply` will and won't
+change: [citation_verification.md](citation_verification.md).
+
 ### Ingestion
 
 `review.ttl` is ready to load as-is — it parses under both rdflib and

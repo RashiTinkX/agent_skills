@@ -34,6 +34,7 @@ modes:
 | **Account for what was read and why** | PRISMA flow + exports | How many full texts were retrieved and by which route, how many decisions were made on full text vs abstract, and exclusion reasons per stage. |
 | **Export for humans and for machines** | `export_review.py` | `md`, `ttl` (SLR ontology, triple-store ready), `jsonld`, `json`, `bib`, plus `charting`, `appraisal`, `per-group`, `narrative`. |
 | **Answer the review's research questions, per study and per question** | `research_questions.py` (automatic) | The protocol's questions are charted per article, then organised question-first into every export: a Markdown appendix, a `research_questions` JSON block, and `slr:ResearchQuestion` nodes you can query without string-matching an id. |
+| **Verify every citation** | `verify_citations.py` | DOIs and PMIDs checked against Crossref / DataCite / PubMed: real, pointing at the paper the review names (title, author, year compared), not retracted. Every in-text PMID / DOI / author–year must be an included study. Registry-confirmed fixes with `--apply`; a reference list in APA / Nature / Vancouver / IEEE with `--style`. |
 | **Add the search strategy after the fact** | `update_provenance.py` | Databases, query strings, dates, filters, record counts, registration ID — patched in and re-exported, so a run is never blocked on paperwork. |
 | **Interrogate a finished review** | `query_sparql.py` (16 recipes), `query_postgres.py` (8) | Full-text vs abstract-only inclusions, retrieval routes, reading basis, screening decisions, exclusion reasons, research-question answers, EZproxy-sourced articles, full-text search over the store. |
 | **Run without an OpenRouter key** | `export_review.py` | The agent performs the stages itself and serialises through the same exporters — identical schema and exports, different author. |
@@ -54,6 +55,7 @@ synthscholar/
 ├── references/
 │   ├── protocol_intake.md       # complete ReviewProtocol field catalog (intake)
 │   ├── byo_corpus_review.md     # user-supplied-PDF workflow, schemas, PRISMA flow rules
+│   ├── citation_verification.md # citation checks, finding codes → actions, styles
 │   ├── sparql_queries.md        # SPARQL recipe catalog
 │   ├── sql_queries.md           # SQL recipe catalog
 │   └── data_model.md            # SLR ontology + DB schema + provenance values
@@ -67,6 +69,7 @@ synthscholar/
     ├── export_review.py         # validate + export a review to md/ttl/jsonld/bib/…
     ├── research_questions.py    #   └─ organises the RQ answers question-first
     ├── update_provenance.py     # add the search strategy later, then re-export
+    ├── verify_citations.py      # DOIs/PMIDs vs registries, retractions, in-text citations
     ├── query_sparql.py          # run recipes against a .ttl / .jsonld export
     ├── query_postgres.py        # run recipes against the article store DB
     └── backfill_full_text.py    # populate article_full_text from legacy rows
@@ -103,6 +106,10 @@ python scripts/run_local_review.py --protocol protocol.json --corpus corpus.json
 python scripts/export_review.py out/review.json --outdir out/ --formats md ttl
 python scripts/update_provenance.py out/review.json \
     --provenance search_provenance.json --registration CRD42026123456
+
+# Verify citations before handing over / ingesting (exit 1 on errors)
+python scripts/verify_citations.py out/review.json
+python scripts/verify_citations.py out/review.json --apply out/review.verified.json --style apa
 
 # List available named queries
 python scripts/query_sparql.py --list

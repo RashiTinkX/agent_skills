@@ -48,6 +48,7 @@ dependencies:
     run_local_review.py: "synthscholar development checkout + OPENROUTER_API_KEY"
     export_review.py: "synthscholar development checkout"
     update_provenance.py: "synthscholar (models only)"
+    verify_citations.py: "httpx; Crossref, doi.org, NCBI E-utilities — no credentials"
     query_sparql.py: "rdflib"
     query_postgres.py: "psycopg[binary]"
     backfill_full_text.py: "psycopg[binary] + synthscholar, migration 006 applied"
@@ -55,6 +56,7 @@ dependencies:
   environment:
     OPENROUTER_API_KEY: "required by run_local_review.py; unused by the other scripts"
     SYNTHSCHOLAR_EMAIL: "polite-pool contact; Unpaywall requires it (ToS) and is skipped without it"
+    NCBI_API_KEY: "optional; raises the PubMed E-utilities rate limit for verify_citations.py"
     SEMANTIC_SCHOLAR_API_KEY: "optional; lifts Semantic Scholar's 1 req/s public rate limit"
     EZPROXY_HOST: "institutional proxy host, for retrieving paywalled papers"
     EZPROXY_COOKIE_FILE: "browser-exported cookies.txt for that proxy (or EZPROXY_COOKIE)"
