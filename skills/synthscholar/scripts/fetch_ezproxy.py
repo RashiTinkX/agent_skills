@@ -17,21 +17,23 @@ Two stages, in the same order the application's ``FullTextResolver`` uses:
 Open access going first is what makes a mostly-OA corpus work with no library
 setup at all, and keeps the proxy budget for the papers that actually need it.
 
-Authentication for stage 2 is done in a browser, not here: institutional login
-is SSO with MFA. Sign in to your library's proxy, export the cookies, and point
-this at them. Credentials are read from the environment only — never a flag —
-so they can't be captured in a shell history or a provenance record:
-
-    export SYNTHSCHOLAR_EMAIL=you@example.com  # Unpaywall requires it (ToS)
-    export EZPROXY_HOST=ezproxy.myuniversity.edu
-    export EZPROXY_MODE=hostname-suffix        # or login-url
-    export EZPROXY_COOKIE_FILE=~/ezproxy-cookies.txt
-    export EZPROXY_DELAY=3                     # seconds between requests
-    export EZPROXY_MAX_REQUESTS=100            # per-run ceiling
+Stage 2 signs in by itself. The first time a paper isn't open access, a
+browser window opens at the user's library login (SSO, MFA — whatever their
+institution uses); once they are through, the session is saved under
+``~/.config/synthscholar/`` and reused until it expires. The proxy is worked
+out from their email domain, or from ``--institution`` / ``--library-link``
+(see ``ezproxy_login.py``). Nothing to configure. Power users can still set
+``EZPROXY_HOST`` / ``EZPROXY_MODE`` / ``EZPROXY_COOKIE_FILE`` by hand, and
+those win; ``EZPROXY_DELAY`` / ``EZPROXY_MAX_REQUESTS`` tune the pacing.
 
 Usage:
     # what can this run reach?
     python fetch_ezproxy.py --status
+
+    # sign in through the library now (otherwise it happens on first need)
+    python fetch_ezproxy.py --login                     # proxy from your email
+    python fetch_ezproxy.py --login --institution mit   # or name it
+    python fetch_ezproxy.py --logout
 
     # fill in every corpus entry that has a DOI but no full text
     python fetch_ezproxy.py --corpus corpus.json --pdf-dir ./pdfs
@@ -61,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import json
 import re
 import sys
@@ -70,6 +73,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_corpus import build_item  # noqa: E402
 from oa_client import OAConfig, OAResolver  # noqa: E402
+import ezproxy_login  # noqa: E402
 
 # Stop after this many consecutive *proxied* failures — usually an expired
 # cookie or a blocked session, and hammering the gateway makes that worse.
@@ -101,6 +105,85 @@ def _require() -> tuple:
         raise SystemExit(2)
 
 
+def proxy_config(EZProxyConfig):
+    """``EZPROXY_*`` from the environment when set, else the saved browser login."""
+    cfg = EZProxyConfig.from_env()
+    if not cfg.enabled:
+        saved = ezproxy_login.load_saved()
+        if saved and (not cfg.host or cfg.host == saved["host"]):
+            cfg.host, cfg.mode, cfg.cookie_file = saved["host"], saved["mode"], saved["cookie_file"]
+    return cfg
+
+
+class AutoLoginFetcher:
+    """An ``EZProxyFetcher`` that signs the user in the first time it is needed.
+
+    ``fetch_one`` asks ``available`` only after open access has missed, so a
+    run whose papers are all open access never opens a browser. On that first
+    ask the saved session is checked against the proxy; if there is none, or it
+    has expired, a browser window opens for the user to sign in (once per run).
+    """
+
+    def __init__(self, EZProxyConfig, EZProxyFetcher, *, login_kwargs: dict,
+                 allow_login: bool, max_chars: int = 0):
+        self._Config, self._Fetcher = EZProxyConfig, EZProxyFetcher
+        self._login_kwargs, self._allow = login_kwargs, allow_login
+        self._max_chars = max_chars
+        self._inner = self._make(proxy_config(EZProxyConfig))
+        self._checked = False
+        self.login_error: str = ""
+
+    def _make(self, cfg):
+        return self._Fetcher(config=cfg, max_chars=self._max_chars) if self._max_chars \
+            else self._Fetcher(config=cfg)
+
+    @property
+    def available(self) -> bool:
+        if not self._checked:
+            self._checked = True
+            self._ensure()
+        return self._inner.available
+
+    def _ensure(self) -> None:
+        cfg = self._inner.config
+        from_env = bool(os.environ.get("EZPROXY_COOKIE") or os.environ.get("EZPROXY_COOKIE_FILE"))
+        if cfg.enabled and from_env:
+            return  # the user configured it by hand: use exactly that
+        if cfg.enabled and ezproxy_login.session_valid(cfg.host, cfg.cookie_file) is not False:
+            return
+        if not self._allow:
+            return
+        try:
+            ezproxy_login.ensure_session(force=cfg.enabled, **self._login_kwargs)
+        except Exception as e:  # a failed sign-in must not lose the rest of the run
+            self.login_error = str(e)
+            print(f"NOTE  institutional access unavailable: {e}", file=sys.stderr)
+            return
+        self._inner.close()
+        self._inner = self._make(proxy_config(self._Config))
+
+    @property
+    def can_sign_in(self) -> bool:
+        """Configured already, or able to open a browser to sign in."""
+        import importlib.util
+        return self._inner.config.enabled or (
+            self._allow and importlib.util.find_spec("playwright") is not None)
+
+    @property
+    def ready(self) -> bool:
+        """``available`` without the side effect: never checks or signs in."""
+        return self._inner.available
+
+    def status(self) -> str:
+        if self._inner.config.enabled:
+            return self._inner.status()
+        return ("Institutional access: signs in through your library in a browser "
+                "the first time a paywalled paper needs it")
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 _ROUTE_LABELS = {
     "unpaywall_pdf": "Unpaywall (open access)",
     "openalex_pdf": "OpenAlex (open access)",
@@ -123,7 +206,7 @@ def _report_proxy_saving(by_route: dict[str, int], oa, fetcher) -> None:
         return
     msg = (f"{free} of these were open access — retrieved without touching the "
            "institutional proxy")
-    if fetcher is not None and fetcher.available:
+    if fetcher is not None and fetcher.ready:
         left = max(fetcher.config.max_requests - fetcher.requests_made, 0)
         msg += f" ({left} of {fetcher.config.max_requests} proxy requests still unspent)"
     print(msg + ".")
@@ -247,8 +330,8 @@ def run_corpus(args: argparse.Namespace, fetcher, pdf_dir: Path, oa=None) -> int
             if consecutive >= MAX_CONSECUTIVE_FAILURES:
                 print(f"\nStopping after {consecutive} consecutive institutional "
                       "failures — the session cookie has probably expired, or these "
-                      "titles aren't in your institution's licence. Re-export cookies "
-                      "and re-run; already-fetched entries are skipped.")
+                      "titles aren't in your institution's licence. Re-run with --login "
+                      "to sign in again; already-fetched entries are skipped.")
                 break
             continue
         pdf, source = hit
@@ -308,7 +391,7 @@ def run_dois(args: argparse.Namespace, fetcher, pdf_dir: Path, dois: list[str],
             print(f"  MISS  {doi}")
             if consecutive >= MAX_CONSECUTIVE_FAILURES:
                 print(f"\nStopping after {consecutive} consecutive institutional "
-                      "failures — re-export your session cookies and re-run.")
+                      "failures — re-run with --login to sign in again.")
                 break
             continue
         pdf, source = hit
@@ -360,13 +443,45 @@ def main() -> int:
                     help="skip the open-access chain (institutional access only)")
     ap.add_argument("--dry-run", action="store_true",
                     help="list what would be fetched; make no requests")
+    sign = ap.add_argument_group("library sign-in (replaces the EZPROXY_* variables)")
+    sign.add_argument("--login", action="store_true",
+                      help="sign in through your library now, in a browser, and save the session")
+    sign.add_argument("--logout", action="store_true", help="forget the saved library session")
+    sign.add_argument("--institution", default="", metavar="NAME_OR_DOMAIN",
+                      help="your university, e.g. 'mit' or 'mit.edu' (default: from your email)")
+    sign.add_argument("--library-link", default="", metavar="URL",
+                      help="any link your library gives when you open an article off campus")
+    sign.add_argument("--proxy-host", default="", metavar="HOST",
+                      help="the EZproxy host itself, if you know it")
+    sign.add_argument("--no-login", action="store_true",
+                      help="never open a browser; skip paywalled papers instead")
     args = ap.parse_args()
+    login_kwargs = {"proxy_host": args.proxy_host, "library_link": args.library_link,
+                    "institution": args.institution}
+
+    if args.logout:
+        removed = ezproxy_login.logout()
+        print("Removed: " + ", ".join(removed) if removed else "No saved library session.")
+        return 0
+    if args.login:
+        try:
+            st = ezproxy_login.ensure_session(force=True, **login_kwargs)
+        except ezproxy_login.LoginError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return e.code
+        ok = ezproxy_login.session_valid(st["host"], st["cookie_file"])
+        print(f"Signed in via {st['host']} ({st['mode']}; proxy found from {st['host_source']}). "
+              + ("Session verified." if ok else "Saved — couldn't verify it from here.")
+              + f"\nSaved to {ezproxy_login.state_dir()} — later runs reuse it.")
+        return 0
 
     if args.oa_only and args.no_oa:
         ap.error("--oa-only and --no-oa are mutually exclusive")
 
     EZProxyConfig, EZProxyFetcher = _require()
-    fetcher = None if args.oa_only else EZProxyFetcher(config=EZProxyConfig.from_env())
+    fetcher = None if args.oa_only else AutoLoginFetcher(
+        EZProxyConfig, EZProxyFetcher, login_kwargs=login_kwargs,
+        allow_login=not (args.no_login or args.dry_run or args.status))
     oa = None if args.no_oa else OAResolver(config=OAConfig.from_env())
 
     def _status_lines() -> str:
@@ -379,13 +494,13 @@ def main() -> int:
         print(_status_lines())
         # Usable if *either* route works — open access alone is a legitimate
         # configuration, and the common one for a first-time user.
-        return 0 if (oa is not None or (fetcher is not None and fetcher.available)) else 1
+        return 0 if (oa is not None or (fetcher is not None and fetcher.ready)) else 1
 
     dois = _load_dois(args)
     if not args.corpus and not dois:
         ap.error("give --corpus and/or --doi/--doi-file (or --status)")
 
-    usable = (oa is not None) or (fetcher is not None and fetcher.available)
+    usable = (oa is not None) or (fetcher is not None and fetcher.can_sign_in)
     if not usable and not args.dry_run:
         print("ERROR: no retrieval route available.", file=sys.stderr)
         print(_status_lines(), file=sys.stderr)
@@ -397,8 +512,8 @@ def main() -> int:
     pdf_dir.mkdir(parents=True, exist_ok=True)
     if not args.dry_run:
         print(_status_lines())
-        if fetcher is not None and not fetcher.available:
-            print("NOTE  paywalled papers will be missed — " + fetcher.status())
+        if args.no_login and fetcher is not None and not fetcher._inner.config.enabled:
+            print("NOTE  --no-login: paywalled papers will be missed")
 
     try:
         if args.corpus:
