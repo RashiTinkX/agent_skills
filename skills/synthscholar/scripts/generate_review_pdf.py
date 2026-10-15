@@ -847,7 +847,10 @@ def build_command(src: Path, md: Path, out: Path, engine: str, *, meta: Optional
         if mainfont and family in UNICODE_TEX:
             cmd += ["-V", f"mainfont={mainfont}"]
     elif family in TYPST_ENGINES:
-        cmd += ["-V", "fontsize=10pt", "-V", "papersize=a4"]
+        cmd += ["-V", "fontsize=10pt", "-V", "papersize=a4",
+                # typst reads files only under its root (the temp dir); the figures are
+                # absolute paths elsewhere, so open the root to the filesystem
+                "--pdf-engine-opt=--root=" + os.path.abspath(os.sep)]
     elif css:
         cmd += ["--css", str(css), "--embed-resources"]
 
