@@ -164,7 +164,13 @@ python scripts/run_local_review.py --protocol protocol.json --corpus corpus.json
 python scripts/update_provenance.py out/review.json \
     --provenance search_provenance.json --outdir out/
 
-# 6. Citations — gate before handing the review over (exit 1 on errors).
+# 6a. Writing — the prose must read as a formal review, not generated text.
+#     Rewrite every flagged sentence in out/review.json (prose only; see
+#     references/writing_style.md), repeat until clean, then re-export.
+python scripts/check_writing.py out/review.json
+python scripts/export_review.py out/review.json --outdir out/ --formats md ttl json
+
+# 6b. Citations — gate before handing the review over (exit 1 on errors).
 #    --apply writes registry-confirmed fixes to a copy; re-export it over the
 #    review, then verify again so the report describes what will ship.
 python scripts/verify_citations.py out/review.json
@@ -250,6 +256,27 @@ python scripts/research_questions.py out/review.json --outdir out/ --themes them
   question IRIs. Never hand-assemble that view or paste the answers into the
   synthesis: it is generated, and a hand-made copy goes stale on the next
   export.
+- **The review's prose is formal scientific writing and must not read as
+  generated.** Write it that way from the start when you author the review
+  (Path B). Either path ends with a revision pass:
+  `check_writing.py out/review.json` flags each sentence with an AI pattern
+  or an informal register, and you rewrite those sentences **in
+  `review.json`**, following
+  [references/writing_style.md](references/writing_style.md):
+  - count studies ("seven of 12"), not "many studies";
+  - attribute findings to studies, not to "research";
+  - "significant" only with its test;
+  - "associated with" for observational evidence;
+  - GRADE wording that matches the certainty ("probably" at moderate, "may"
+    at low);
+  - no contractions, reader address, stacked hedges or "paves the way".
+
+  Change only the review's own prose: never quoted evidence, charted
+  answers, numbers, citations, ratings or research questions. A rewrite
+  never adds a claim or a number the review's data doesn't hold. After
+  rewriting, re-run the checker until it reports no errors, then re-export
+  and re-verify citations. The checker catches patterns, not argument, so
+  read the prose through once as well.
 - **Verify citations before handing the review over.** Run
   `verify_citations.py` on `review.json` after every export. It resolves each
   included article's DOI and PMID against Crossref / DataCite / PubMed, compares
@@ -391,7 +418,7 @@ step can't run and carry on with the rest.
 | `build_corpus.py` | `pymupdf`; `docling` optional | `python -c "import fitz"` | `pip install pymupdf` (+ `pip install docling` for scans/tables) |
 | `export_review.py`, `run_local_review.py`, `update_provenance.py` | `synthscholar` dev checkout | the script refuses with a message | `pip install -e /path/to/prisma-review-agent` (ask for the path) |
 | `generate_review_pdf.py` | `pandoc` + one PDF engine; `fc-list` optional | `python scripts/generate_review_pdf.py --check-deps` | `conda install -c conda-forge pandoc typst` (or `tectonic`); `brew install pandoc` / `apt-get install pandoc` without conda |
-| `validate_protocol.py`, `research_questions.py` | stdlib | — | — |
+| `validate_protocol.py`, `research_questions.py`, `check_writing.py` | stdlib | — | — |
 
 Network services (Crossref, PubMed, Unpaywall) and `OPENROUTER_API_KEY` are
 not installs: mention them if a run will need them, and ask the user for any
@@ -428,6 +455,7 @@ python scripts/run_local_review.py --protocol protocol.json --corpus corpus.json
 python scripts/export_review.py out/review.json --outdir out/ --formats md ttl
 python scripts/research_questions.py out/review.json --outdir out/   # retrofit only
 python scripts/update_provenance.py out/review.json --provenance search_provenance.json
+python scripts/check_writing.py out/review.json                        # AI-voice / register pass
 python scripts/verify_citations.py out/review.json                     # citation gate
 python scripts/verify_citations.py out/review.json --style apa --apply out/review.verified.json
 python scripts/generate_review_pdf.py out/review.md --references apa --include charting citations
@@ -461,6 +489,10 @@ scripts) to see every named recipe.
 - [references/citation_verification.md](references/citation_verification.md) —
   what `verify_citations.py` checks, every finding code with the action it
   calls for, `--apply` semantics, and the reference styles.
+- [references/writing_style.md](references/writing_style.md) — the formal
+  register the review's prose must meet: review-specific rules (study counts,
+  attribution, GRADE wording), the AI-writing patterns `check_writing.py`
+  flags, what a rewrite may never touch, and the revision pass.
 - [references/sparql_queries.md](references/sparql_queries.md) — SPARQL recipe catalog.
 - [references/sql_queries.md](references/sql_queries.md) — SQL recipe catalog.
 - [references/data_model.md](references/data_model.md) — the SLR-ontology terms

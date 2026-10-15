@@ -339,6 +339,16 @@ disappears; the fix is to re-point it at the equivalent entry point.
 Use when there's no OpenRouter key. You perform the stages; the result is the
 same schema, exported by the same code.
 
+Write every prose field in the formal register of
+[writing_style.md](writing_style.md) from the first draft:
+- study counts rather than "many studies";
+- findings attributed to the included studies;
+- GRADE-matched wording;
+- no AI vocabulary.
+
+It is cheaper than rewriting afterwards. Then run
+`python scripts/check_writing.py review.json` before exporting.
+
 ```bash
 python scripts/export_review.py --print-template > review.json   # valid example
 # …replace the EXAMPLE content with the real review…
