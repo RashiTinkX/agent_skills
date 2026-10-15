@@ -218,6 +218,11 @@ python scripts/research_questions.py out/review.json --outdir out/ --themes them
     preprint and a peer-reviewed article, cite, fetch and read the
     peer-reviewed article. Its venue DOI is the article's DOI.
   - **Add the PubMed ID wherever PubMed has the article.**
+  - **Read the published version where possible.** If neither open access
+    nor the proxy can reach it, read its preprint, then a copy deposited on
+    Zenodo or arXiv, but still cite the published DOI. Say in the
+    limitations which studies were read from a preprint or a deposited
+    copy. ResearchGate and Academia.edu are never used.
   - **Cite a preprint only when no peer-reviewed version exists.** Label it
     as a preprint, and say in the limitations that it is not peer-reviewed.
 
@@ -376,6 +381,7 @@ parity: `slr:content_hash` in RDF equals `article_full_text.content_sha256`.
 - **Audit provenance** — which resolver produced each full text (`pmc_oa`,
   `europe_pmc_oa`, `unpaywall_pdf`, `biorxiv_pdf`, `openalex_pdf`,
   `semanticscholar_pdf`, `ezproxy_pdf` — institutional subscription access —
+  `zenodo_pdf`, `arxiv_pdf` — deposited copies, the last resort —
   `user_supplied_pdf`, `article_store`, `cache`) and when.
 - **Ask what the review actually read** — how many reports were retrieved vs
   not, how many eligibility decisions were made on full text vs abstract only,

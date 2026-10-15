@@ -198,13 +198,28 @@ Notes that matter:
   and the user completes it themselves. Only the proxy's resulting session
   cookies are kept. They expire; an expired session is detected before use
   and the browser reopens, rather than the failure looking like a paywall.
-- **The peer-reviewed version is fetched first.** A preprint DOI (bioRxiv,
-  medRxiv, arXiv, Research Square, SSRN, PsyArXiv, …) is looked up for a
-  registry-linked published version. That version is tried on both routes,
-  open access and then the proxy, before the preprint itself. The corpus
-  entry's `doi` becomes the published one, with the preprint in
-  `_preprint_doi`; in `--doi` mode the manifest records `version` and
-  `preprint_doi`. `--as-given` fetches exactly the DOI supplied.
+- **Reading order: the peer-reviewed version first, then fallbacks.** For
+  each paper:
+  1. the published version, through open access and then the proxy;
+  2. its registry-linked preprint, through the same two routes;
+  3. a repository-deposited copy: **Zenodo**, then **arXiv**, matched by
+     exact title *and* first author, and accepted only if it really is a
+     PDF.
+
+  The two-way registry link covers both cases: a supplied preprint DOI is
+  upgraded to its published version, and a published DOI falls back to its
+  preprint. The paper is always **cited** by its published DOI, and what was
+  actually **read** is recorded: `_read_version` (`preprint` /
+  `deposited-copy`), `_read_doi` / `_read_url`, and `_preprint_doi` when the
+  user supplied the preprint. In `--doi` mode the same facts go in the
+  manifest, which `build_corpus.py --manifest` maps back.
+- **Say what was read.** If a study was read from a preprint or a deposited
+  copy, say so in the limitations: results can differ from the published
+  version, so "full text of N studies was read from preprints or author
+  copies" belongs there.
+- **ResearchGate and Academia.edu are never queried.** Their terms forbid
+  automated access. `--no-deposits` skips step 3 and `--as-given` skips
+  version handling altogether.
 - **An open-access miss is not a failure.** Most DOIs have no free copy; that's
   normal and says nothing about the next one. Only *proxied* failures trip the
   stop-after-3 circuit breaker, because those really do indicate a dead session.

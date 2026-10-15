@@ -75,6 +75,7 @@ from build_corpus import build_item  # noqa: E402
 from oa_client import OAConfig, OAResolver  # noqa: E402
 import ezproxy_login  # noqa: E402
 from verify_citations import Registry  # noqa: E402  (preprint → published version)
+from deposited_copies import DepositFinder, authors_string  # noqa: E402
 
 # Stop after this many consecutive *proxied* failures — usually an expired
 # cookie or a blocked session, and hammering the gateway makes that worse.
@@ -190,6 +191,8 @@ _ROUTE_LABELS = {
     "openalex_pdf": "OpenAlex (open access)",
     "semanticscholar_pdf": "Semantic Scholar (open access)",
     "ezproxy_pdf": "institutional access",
+    "zenodo_pdf": "Zenodo (deposited copy)",
+    "arxiv_pdf": "arXiv (deposited copy)",
 }
 
 
@@ -235,20 +238,33 @@ def _needs_fetch(item: dict) -> bool:
         (item.get("doi") or "").strip())
 
 
-def fetch_one(doi: str, pdf_dir: Path, oa=None, fetcher=None,
-              versions=None) -> tuple[Path, str, str, str] | None:
-    """Fetch one DOI's PDF into *pdf_dir*; return ``(path, source, doi_read, version)``.
+def fetch_one(doi: str, pdf_dir: Path, oa=None, fetcher=None, versions=None,
+              deposits=None, hint: dict | None = None) -> dict | None:
+    """Fetch one paper's PDF into *pdf_dir*; None when every route missed.
 
-    **The peer-reviewed version is read first.** When ``doi`` is a preprint whose
-    registry record links its published version, that version is tried before
-    the preprint, on both routes; the preprint is the fallback. ``version`` says
-    which was read: ``published``, ``preprint`` or ``as-given`` (not a preprint,
-    or no lookup). Within each version, open access comes first and
-    institutional access only if it misses, so a free paper never costs a
+    Reading order — **the peer-reviewed version first, then fallbacks**:
+
+    1. the published version: open access, then institutional access;
+    2. its registry-linked preprint, by the same two routes;
+    3. a repository-deposited copy (Zenodo, arXiv), found by exact title and
+       first author (``deposited_copies.py``).
+
+    The paper is always *cited* by its published DOI (``cite_doi``); what was
+    actually *read* is recorded separately (``read_doi`` / ``read_url``,
+    ``version``), so a review read from a preprint or deposited copy says so.
+    Within each version open access comes first, so a free copy never costs a
     proxied request.
     """
-    candidates = versions.preferred_versions(doi) if versions is not None else [(doi, "as-given")]
-    for d, kind in candidates:
+    plan = (versions.fetch_plan(doi) if versions is not None
+            else {"cite": doi, "tries": [(doi, "as-given")], "title": "", "authors": []})
+
+    def save(data: bytes, name: str) -> Path:
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+        path = pdf_dir / f"{_safe_name(name)}.pdf"
+        path.write_bytes(data)
+        return path
+
+    for d, kind in plan["tries"]:
         data = source = None
         if oa is not None:
             hit = oa.fetch_pdf_bytes(d)
@@ -258,18 +274,50 @@ def fetch_one(doi: str, pdf_dir: Path, oa=None, fetcher=None,
             data = fetcher.fetch_pdf_bytes(doi=d)
             source = "ezproxy_pdf"
         if data:
-            pdf_dir.mkdir(parents=True, exist_ok=True)
-            path = pdf_dir / f"{_safe_name(d)}.pdf"
-            path.write_bytes(data)
-            return path, source or "ezproxy_pdf", d, kind
+            return {"path": save(data, d), "source": source or "ezproxy_pdf", "cite_doi": plan["cite"],
+                    "read_doi": d, "read_url": "", "version": kind}
+
+    if deposits is not None:
+        title = (hint or {}).get("title") or plan["title"]
+        authors = (hint or {}).get("authors") or authors_string(plan["authors"])
+        found = deposits.fetch(title, authors) if title and authors else None
+        if found:
+            data, source, url = found
+            return {"path": save(data, plan["cite"]), "source": source, "cite_doi": plan["cite"],
+                    "read_doi": "", "read_url": url, "version": "deposited-copy"}
     return None
 
 
-def _version_note(requested: str, read: str, kind: str) -> str:
-    if kind == "published" and read.lower() != requested.lower():
-        return f" (peer-reviewed version of preprint {requested})"
+def _record_version(entry: dict, requested: str, hit: dict, manifest: bool = False) -> dict:
+    """Cite the published DOI; record what was read when it was something else.
+
+    Corpus entries carry the extra facts as private ``_`` fields (kept out of
+    the review model); the manifest carries them as plain keys, which
+    ``build_corpus.py --manifest`` maps back to the same private fields.
+    """
+    p = "" if manifest else "_"
+    entry["doi"] = hit["cite_doi"]
+    if requested.lower() != hit["cite_doi"].lower():
+        entry[f"{p}preprint_doi" if hit["version"] != "as-given" else f"{p}requested_doi"] = requested
+    if hit["version"] in ("preprint", "deposited-copy") or manifest:
+        entry[f"{p}read_version"] = hit["version"]
+    if hit["read_doi"] and hit["read_doi"].lower() != hit["cite_doi"].lower():
+        entry[f"{p}read_doi"] = hit["read_doi"]
+    if hit["read_url"]:
+        entry[f"{p}read_url"] = hit["read_url"]
+    return entry
+
+
+def _version_note(requested: str, hit: dict) -> str:
+    kind, cite, read = hit["version"], hit["cite_doi"], hit["read_doi"]
+    if kind == "deposited-copy":
+        return f" (deposited copy, {hit['read_url']}; cited as {cite})"
+    if kind == "preprint" and read.lower() != cite.lower():
+        return f" (preprint {read} — the published version {cite} was not accessible; cited as {cite})"
     if kind == "preprint":
-        return " (preprint — its peer-reviewed version could not be retrieved)"
+        return " (preprint — no peer-reviewed version found)"
+    if cite.lower() != requested.lower():
+        return f" (peer-reviewed version of preprint {requested})"
     return ""
 
 
@@ -302,7 +350,8 @@ def merge_into_entry(item: dict, pdf: Path, max_chars: int,
     return item
 
 
-def run_corpus(args: argparse.Namespace, fetcher, pdf_dir: Path, oa=None, versions=None) -> int:
+def run_corpus(args: argparse.Namespace, fetcher, pdf_dir: Path, oa=None, versions=None,
+               deposits=None) -> int:
     corpus_path = Path(args.corpus)
     raw = json.loads(corpus_path.read_text(encoding="utf-8"))
     # Accept both shapes build_corpus.py has written: {"items": [...]} and a
@@ -335,7 +384,8 @@ def run_corpus(args: argparse.Namespace, fetcher, pdf_dir: Path, oa=None, versio
     by_route: dict[str, int] = {}
     for it in todo:
         doi = it["doi"].strip()
-        hit = fetch_one(doi, pdf_dir, oa=oa, fetcher=fetcher, versions=versions)
+        hit = fetch_one(doi, pdf_dir, oa=oa, fetcher=fetcher, versions=versions,
+                        deposits=deposits, hint=it)
         if hit is None:
             failed += 1
             # Only a proxied miss is evidence of a broken session. When the
@@ -350,17 +400,14 @@ def run_corpus(args: argparse.Namespace, fetcher, pdf_dir: Path, oa=None, versio
                       "to sign in again; already-fetched entries are skipped.")
                 break
             continue
-        pdf, source, read_doi, kind = hit
+        pdf, source = hit["path"], hit["source"]
         consecutive = 0
         merge_into_entry(it, pdf, args.max_chars, source)
-        if read_doi.lower() != doi.lower():
-            # the review now reads, and so cites, the peer-reviewed version
-            it["_preprint_doi"] = doi
-            it["doi"] = read_doi
+        _record_version(it, doi, hit)
         by_route[source] = by_route.get(source, 0) + 1
         ok += 1
-        print(f"  OK    {read_doi} → {pdf.name} ({len(it['full_text'])} chars) "
-              f"[{_ROUTE_LABELS.get(source, source)}]{_version_note(doi, read_doi, kind)}")
+        print(f"  OK    {hit['cite_doi']} → {pdf.name} ({len(it['full_text'])} chars) "
+              f"[{_ROUTE_LABELS.get(source, source)}]{_version_note(doi, hit)}")
 
     out = Path(args.out) if args.out else corpus_path
     corpus["items"] = items
@@ -388,7 +435,7 @@ def run_corpus(args: argparse.Namespace, fetcher, pdf_dir: Path, oa=None, versio
 
 
 def run_dois(args: argparse.Namespace, fetcher, pdf_dir: Path, dois: list[str],
-             oa=None, versions=None) -> int:
+             oa=None, versions=None, deposits=None) -> int:
     if args.limit:
         dois = dois[: args.limit]
     print(f"{len(dois)} DOI(s) to fetch into {pdf_dir}")
@@ -403,7 +450,7 @@ def run_dois(args: argparse.Namespace, fetcher, pdf_dir: Path, dois: list[str],
     by_route: dict[str, int] = {}
     manifest: dict[str, dict] = {}
     for doi in dois:
-        hit = fetch_one(doi, pdf_dir, oa=oa, fetcher=fetcher, versions=versions)
+        hit = fetch_one(doi, pdf_dir, oa=oa, fetcher=fetcher, versions=versions, deposits=deposits)
         if hit is None:
             failed += 1
             if fetcher is not None and fetcher.available:
@@ -414,15 +461,15 @@ def run_dois(args: argparse.Namespace, fetcher, pdf_dir: Path, dois: list[str],
                       "failures — re-run with --login to sign in again.")
                 break
             continue
-        pdf, source, read_doi, kind = hit
+        pdf, source = hit["path"], hit["source"]
         consecutive = 0
         ok += 1
         by_route[source] = by_route.get(source, 0) + 1
         # Keyed by filename: that is what build_corpus.py's --manifest matches on.
-        manifest[pdf.name] = {"doi": read_doi, "full_text_source": source, "version": kind,
-                              **({"preprint_doi": doi} if read_doi.lower() != doi.lower() else {})}
-        print(f"  OK    {read_doi} → {pdf.name} [{_ROUTE_LABELS.get(source, source)}]"
-              f"{_version_note(doi, read_doi, kind)}")
+        manifest[pdf.name] = _record_version({"doi": doi, "full_text_source": source}, doi, hit,
+                                             manifest=True)
+        print(f"  OK    {hit['cite_doi']} → {pdf.name} [{_ROUTE_LABELS.get(source, source)}]"
+              f"{_version_note(doi, hit)}")
 
     print(f"\nRetrieved {ok}, failed {failed}.")
     for route, n in sorted(by_route.items(), key=lambda kv: -kv[1]):
@@ -465,6 +512,8 @@ def main() -> int:
                     help="skip the open-access chain (institutional access only)")
     ap.add_argument("--dry-run", action="store_true",
                     help="list what would be fetched; make no requests")
+    ap.add_argument("--no-deposits", action="store_true",
+                    help="don't fall back to repository-deposited copies (Zenodo, arXiv)")
     ap.add_argument("--as-given", action="store_true",
                     help="fetch each DOI exactly as given — don't swap a preprint for its "
                          "peer-reviewed version")
@@ -510,8 +559,10 @@ def main() -> int:
     oa = None if args.no_oa else OAResolver(config=OAConfig.from_env())
     # Peer-reviewed first: a preprint DOI is fetched as its published version
     # when the registry links one (Crossref is-preprint-of), the preprint after.
-    versions = None if (args.as_given or args.dry_run or args.status) else Registry(
-        mailto=(os.environ.get("SYNTHSCHOLAR_EMAIL") or os.environ.get("NCBI_EMAIL") or ""))
+    mailto = os.environ.get("SYNTHSCHOLAR_EMAIL") or os.environ.get("NCBI_EMAIL") or ""
+    versions = None if (args.as_given or args.dry_run or args.status) else Registry(mailto=mailto)
+    # Last route, after published + preprint missed on both open access and the proxy.
+    deposits = None if (args.no_deposits or args.dry_run or args.status) else DepositFinder(mailto=mailto)
 
     def _status_lines() -> str:
         parts = [oa.status() if oa is not None else "Open access: disabled (--no-oa)"]
@@ -546,16 +597,18 @@ def main() -> int:
 
     try:
         if args.corpus:
-            rc = run_corpus(args, fetcher, pdf_dir, oa=oa, versions=versions)
+            rc = run_corpus(args, fetcher, pdf_dir, oa=oa, versions=versions, deposits=deposits)
             if dois:
-                rc = run_dois(args, fetcher, pdf_dir, dois, oa=oa, versions=versions) or rc
+                rc = run_dois(args, fetcher, pdf_dir, dois, oa=oa, versions=versions, deposits=deposits) or rc
             return rc
-        return run_dois(args, fetcher, pdf_dir, dois, oa=oa, versions=versions)
+        return run_dois(args, fetcher, pdf_dir, dois, oa=oa, versions=versions, deposits=deposits)
     finally:
         if fetcher is not None:
             fetcher.close()
         if versions is not None:
             versions.close()
+        if deposits is not None:
+            deposits.close()
         if oa is not None:
             oa.close()
 

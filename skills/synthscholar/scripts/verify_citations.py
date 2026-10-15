@@ -418,18 +418,35 @@ class Registry:
                 found.append(d)
         return found
 
-    def preferred_versions(self, doi: str) -> list[tuple[str, str]]:
-        """DOIs to cite or fetch for ``doi``, best first: [(doi, 'published'|'preprint'|'as-given')].
+    def fetch_plan(self, doi: str) -> dict:
+        """What to cite and what to try reading for ``doi``, best first.
 
-        A preprint with a registry-linked peer-reviewed version (either
-        direction, see published_versions) puts that version first. Anything
-        else is returned as given.
+        ``cite`` is the DOI the review cites: the peer-reviewed version when
+        one exists. ``tries`` is ``[(doi, version)]`` in reading order: the
+        published version(s) first, then the preprint. That holds whichever
+        of the two the user supplied, because a registry-linked preprint is a
+        legitimate fallback copy when the published text is unreachable.
+        ``title`` / ``authors`` describe the cited work, for the
+        deposited-copy search.
         """
         doi = clean_doi(doi)
         status, meta = self.lookup_doi(doi, check_updates=False)
-        if status not in ("crossref", "other-registry") or not is_preprint(doi, meta):
-            return [(doi, "as-given")]
-        return [(d, "published") for d in self.published_versions(doi, meta)] + [(doi, "preprint")]
+        if status not in ("crossref", "other-registry"):
+            return {"cite": doi, "tries": [(doi, "as-given")], "title": "", "authors": []}
+        if is_preprint(doi, meta):
+            pubs = self.published_versions(doi, meta)
+            tries = [(d, "published") for d in pubs] + [(doi, "preprint")]
+            cite = pubs[0] if pubs else doi
+        else:
+            pres = [clean_doi(d) for d in meta.get("has_preprint") or [] if d]
+            tries = [(doi, "as-given")] + [(d, "preprint") for d in pres]
+            cite = doi
+        return {"cite": cite, "tries": tries, "title": meta.get("title", ""),
+                "authors": meta.get("authors") or []}
+
+    def preferred_versions(self, doi: str) -> list[tuple[str, str]]:
+        """``fetch_plan(doi)["tries"]``: DOIs to read, best first."""
+        return self.fetch_plan(doi)["tries"]
 
     def pmid_for_doi(self, doi: str) -> Optional[str]:
         """The PubMed ID registered for ``doi``, if PubMed has exactly one."""
@@ -565,6 +582,8 @@ def parse_crossref(msg: dict) -> dict:
         "published_as": [r.get("id", "") for r in rel.get("is-preprint-of") or []
                          if (r.get("id-type") or "doi") == "doi"],
         "subtype": msg.get("subtype", ""),
+        "has_preprint": [r.get("id", "") for r in rel.get("has-preprint") or []
+                         if (r.get("id-type") or "doi") == "doi"],
     }
 
 
