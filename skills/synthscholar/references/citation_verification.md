@@ -49,11 +49,13 @@ cited retracted *paper*, which is the case that matters.
 Every string in the review result except its inputs and logs (`included_articles`,
 `screening_log`, `protocol`, search/run metadata) is scanned: synthesis,
 introduction, discussion, GRADE, bias assessment, per-group answers, narrative
-rows, and structured id fields (`paper_pmid`, `*_pmids`).
+rows, and structured id fields (`paper_pmid`, `*_pmids`). Evidence spans
+are quotes from the source papers, so only their `paper_pmid` is checked; a
+citation inside a quote belongs to that paper's own reference list.
 
 | Citation form | Must |
 | --- | --- |
-| `PMID: 123`, `PMID: local_ab12cd34`, `*_pmids` lists | be an included article |
+| `PMID: 123`, `PMIDs: 12345, 67890`, `PMID: local_ab12cd34`, `*_pmids` lists | be an included article (list items after the first must look like PMIDs, 5+ digits, so "PMID: 123, 2019 cohort" reads one PMID) |
 | a DOI | be an included article's DOI |
 | `(Smith et al., 2023)`, `Smith et al. (2023)` | match an included article's first author and year (±1) |
 | `(Smith et al., 2023; PMID: 123)` | the author–year must belong to PMID 123 |
@@ -100,7 +102,9 @@ registry-confirmed changes:
 
 - DOI field normalised (`https://doi.org/10.x/y.` → `10.x/y`);
 - empty `title` / `year` / `journal` / `authors` filled from a DOI record whose
-  title matched (≥ 0.90);
+  title matched (≥ 0.90). With no title in the review, only when the record's
+  first author **and** year both agree: a hallucinated DOI still resolves to
+  some real paper;
 - a missing DOI filled from PubMed for a PMID whose title matched.
 
 It never applies a `doi-candidate`, never overwrites a non-empty field that
