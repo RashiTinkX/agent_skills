@@ -11,13 +11,13 @@ the web app:
 3. **Count** the hits on PubMed (``--count``), and optionally **fetch** the
    records to CSV / JSONL with an audit ``protocol.json`` (``--fetch``).
 
-Four mapping modes (``--mode``):
+Three mapping modes (``--mode``):
 
   closure    (default) the LLM only marks WHERE each PICO-style concept sits in
              the question, sampled k times and majority-voted; vocabulary is then
-             resolved from the MeSH index alone. Most model-independent.
-  hybrid     a deterministic MeSH candidate slate; the LLM only selects ids.
-  llm        the LLM proposes blocks and headings freely.
+             resolved from the MeSH index alone. Most model-independent;
+             replaces search-strategy-generator's ``hybrid`` mode.
+  llm        the LLM proposes blocks and headings freely (comparison only).
   mesh_only  no LLM at all: every maximal MeSH match becomes a block.
 
 One-time setup — the MeSH index is built locally from NLM's RDF dump (the dump
@@ -70,7 +70,6 @@ def _filters(args: argparse.Namespace) -> dict:
     }
 
 
-
 def _pubmed() -> PubMed:
     return PubMed(api_key=os.environ.get("NCBI_API_KEY", ""),
                   email=os.environ.get("NCBI_EMAIL", ""))
@@ -104,7 +103,6 @@ def _fetch(pm: PubMed, query: str, search: dict, max_records: int, outdir: Path)
     }
     (folder / "protocol.json").write_text(json.dumps(protocol, indent=2), encoding="utf-8")
     return {**protocol, "folder": str(folder)}
-
 
 
 def main() -> int:

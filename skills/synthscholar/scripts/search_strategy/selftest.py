@@ -16,8 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent   # scripts/
 sys.path.insert(0, str(ROOT))
 
 from search_strategy import canonical, pipeline, query_builder            # noqa: E402
-from search_strategy.candidates import (                                  # noqa: E402
-    candidate_slate, group_closure, matched_spans, mesh_only_blocks, span_groups)
+from search_strategy.candidates import matched_spans, mesh_only_blocks    # noqa: E402
 from search_strategy.mesh_index import get_index                          # noqa: E402
 
 Q1 = ("Does optogenetic stimulation of the hippocampus improve memory "
@@ -86,107 +85,30 @@ def main() -> int:
     check("two orderings compile to the same hash", qa["hash"] == qb["hash"],
           f"{qa['hash']} vs {qb['hash']}")
 
-    print("\ncandidate slate")
+    print("\nspan matching (mesh_only)")
     spans = {s["span"].lower(): s["label"] for s in matched_spans(Q1, ix)}
     check("longest match wins ('memory consolidation', not 'memory')",
           spans.get("memory consolidation") == "Memory Consolidation", str(spans))
     check("plural/singular ('rodent' -> Rodentia)", spans.get("rodent") == "Rodentia")
-    labels2 = {c["label"] for c in candidate_slate(Q2, ix)["candidates"]}
-    check("phrase pass finds Single-Cell Gene Expression Analysis",
-          "Single-Cell Gene Expression Analysis" in labels2)
-    check("phrase pass rejects near-miss prefixes (no hip-prosthesis noise)",
-          not any("Arthroplasty" in x for x in
-                  {c["label"] for c in candidate_slate(Q1, ix)["candidates"]}))
-    labels3 = {c["label"] for c in candidate_slate(Q3, ix)["candidates"]}
-    check("compound split reaches CRISPR-Cas Systems", "CRISPR-Cas Systems" in labels3)
-    check("'off-target' stays unmatched (free-text territory)",
-          any("off-target" in u.lower() for u in candidate_slate(Q3, ix)["unmatched"]))
     check("generic words never become blocks",
           not {"Disease", "Models, Theoretical"} & {b["mesh"][0] for b in mesh_only_blocks(Q3, ix)})
 
-    print("\nspan grouping (the question decides what is ORed, not the model)")
-    slate = candidate_slate(Q1, ix)
-    groups = span_groups(slate)
-    gid = {c["label"]: groups[c["id"]] for c in slate["candidates"]}
-    check("a broader term shares its child's group",
-          gid.get("Limbic System") == gid.get("Hippocampus"))
-    check("unrelated facets stay in different groups",
-          gid.get("Hippocampus") != gid.get("Optogenetics"))
-    slate2 = candidate_slate(Q2, ix)
-    g2 = {c["label"]: span_groups(slate2)[c["id"]] for c in slate2["candidates"]}
-    check("overlapping spans share a group (RNA-seq ~ single-cell)",
-          g2.get("Sequence Analysis, RNA") == g2.get("Single-Cell Gene Expression Analysis"))
-    check("Microglia is its own group", g2.get("Microglia") != g2.get("Alzheimer Disease"))
-
-    ids = {c["label"]: c["id"] for c in slate["candidates"]}
-    sel_a = {"blocks": [{"slot": "intervention", "ids": [ids["Optogenetics"]]},
-                        {"slot": "context", "ids": [ids["Hippocampus"]]},
-                        {"slot": "outcome", "ids": [ids["Memory Consolidation"]]}]}
-    sel_b = {"blocks": [{"slot": "intervention",
-                         "ids": [ids["Optogenetics"], ids["Hippocampus"]]},
-                        {"slot": "outcome", "ids": [ids["Memory Consolidation"]]}]}
-    def compile_sel(sel):
-        blocks, _ = pipeline._blocks_from_selection(sel, slate, group_by_span=True)
-        return query_builder.compile_search(
-            pipeline.finalize(canonical.canonicalize_blocks(blocks, ix)["blocks"],
-                              strict=True, ix=ix), {})["hash"]
-    check("same headings, different model grouping -> same query",
-          compile_sel(sel_a) == compile_sel(sel_b),
-          f"{compile_sel(sel_a)} vs {compile_sel(sel_b)}")
-
-    print("\nfacet closure (the question decides the synonyms, the model the facets)")
-    sl3 = candidate_slate(Q3, ix)
-    ids3 = {c["label"]: c["id"] for c in sl3["candidates"]}
-    crispr = group_closure(sl3, [ids3["CRISPR-Cas Systems"]])
-    got = {m["label"] for ms in crispr.values() for m in ms}
-    check("naming one CRISPR descriptor pulls in its whole facet",
-          got == {"CRISPR-Cas Systems", "RNA, Guide, CRISPR-Cas Systems",
-                  "Clustered Regularly Interspaced Short Palindromic Repeats"}, str(sorted(got)))
-    sl2 = candidate_slate(Q2, ix)
-    ids2 = {c["label"]: c["id"] for c in sl2["candidates"]}
-    method = {m["label"] for ms in group_closure(sl2, [ids2["Sequence Analysis, RNA"]]).values()
-              for m in ms}
-    check("closure keeps the well-supported phrase match",
-          "Single-Cell Gene Expression Analysis" in method, str(sorted(method)))
-    check("closure drops one-word phrase noise (Comet Assay)", "Comet Assay" not in method)
-    disease = {m["label"] for ms in group_closure(sl2, [ids2["Alzheimer Disease"]]).values()
-               for m in ms}
-    check("closure drops a phrase weaker than the exact match (Amyloid beta-Peptides)",
-          disease == {"Alzheimer Disease"}, str(sorted(disease)))
-    check("closure replaces a broader pick with the facet's exact heading",
-          {m["label"] for ms in group_closure(sl2, [ids2["Dementia"]]).values() for m in ms}
-          == {"Alzheimer Disease"})
-
     print("\nno model prose reaches a strict query")
-    a = {"blocks": [{"slot": "method", "name": "sequencing", "ids": [ids2["Sequence Analysis, RNA"]],
-                     "freetext": ["scRNA-seq", "single cell transcriptomics"]}]}
-    b = {"blocks": [{"slot": "context", "name": "rna-seq assay",
-                     "ids": [ids2["Sequence Analysis, RNA"]], "freetext": []}]}
-    def compile_sel2(sel):
-        blocks, _ = pipeline._blocks_from_selection(sel, sl2)
-        res = pipeline._assemble(blocks, ["bioinformatics"], merge_slots=False,
+    a = [{"name": "sequencing", "slot": "method", "mesh_candidates": ["RNA Sequencing"],
+          "freetext": ["scRNA-seq", "single cell transcriptomics"]}]
+    b = [{"name": "rna-seq assay", "slot": "context", "mesh_candidates": ["RNA Sequencing"],
+          "freetext": []}]
+    def compile_llm(concepts):
+        res = pipeline._assemble(pipeline._blocks_from_concepts(concepts), ["bioinformatics"],
                                  strict=True, ix=ix)
         return query_builder.compile_search(res["concepts"], {})["hash"]
-    check("differing block names/free-text do not change the query",
-          compile_sel2(a) == compile_sel2(b), f"{compile_sel2(a)} vs {compile_sel2(b)}")
+    check("differing block names/free-text do not change the query (llm mode)",
+          compile_llm(a) == compile_llm(b), f"{compile_llm(a)} vs {compile_llm(b)}")
 
     print("\nmesh_only determinism")
     h = {query_builder.compile_search(
         pipeline.build(Q1, mode="mesh_only")["concepts"], {})["hash"] for _ in range(3)}
     check("three builds -> one hash", len(h) == 1, str(h))
-
-    print("\nslot merging")
-    blocks = [{"name": "m1", "slot": "method", "mesh": ["Sequence Analysis, RNA"], "freetext": []},
-              {"name": "m2", "slot": "method", "mesh": ["Single-Cell Analysis"], "freetext": []},
-              {"name": "c", "slot": "context", "mesh": ["Alzheimer Disease"], "freetext": []}]
-    merged = canonical.canonicalize_blocks(blocks, ix, merge_slots=True)["blocks"]
-    check("same-slot blocks merge into one OR block", len(merged) == 2,
-          str([b["mesh"] for b in merged]))
-    unlabelled = [{"name": "a", "slot": "other", "mesh": ["Microglia"], "freetext": []},
-                  {"name": "b", "slot": "other", "mesh": ["Alzheimer Disease"], "freetext": []}]
-    kept_other = canonical.canonicalize_blocks(unlabelled, ix, merge_slots=True)["blocks"]
-    check("unslotted blocks are NOT merged (they stay ANDed)", len(kept_other) == 2,
-          str([b["mesh"] for b in kept_other]))
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'all checks passed'}")
     return 1 if failures else 0

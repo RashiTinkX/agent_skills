@@ -31,7 +31,7 @@ from .mesh_index import MeshIndex
 
 # Canonical facet vocabulary. Models are asked to label each block with one of
 # these (PICO + the two facets biomedical questions actually add). Used for
-# display, for optional merging, and to keep block names from being free-form
+# display, and to keep block names from being free-form
 # prose that no two models ever spell the same way.
 SLOTS = (
     "population",     # who/what is studied (species, patients, cells, cohort)
@@ -171,7 +171,7 @@ def _content_key(block: dict) -> tuple:
 
 
 def canonicalize_blocks(blocks: list[dict], ix: MeshIndex, *,
-                        prune: bool = True, merge_slots: bool = False) -> dict:
+                        prune: bool = True) -> dict:
     """
     Canonicalize proposed blocks into a deterministic, model-independent form.
 
@@ -181,9 +181,7 @@ def canonicalize_blocks(blocks: list[dict], ix: MeshIndex, *,
       2. drop headings subsumed by a broader heading in the same block
       3. sort headings and free-text; drop empty blocks; drop blocks whose
          content duplicates another block
-      4. optionally merge blocks sharing a slot (broadens: same-slot blocks
-         become one OR block — off by default because it changes semantics)
-      5. sort blocks by content
+      4. sort blocks by content
 
     Returns {"blocks": [...], "dropped": [{"block","candidate"}...]}.
     """
@@ -221,29 +219,6 @@ def canonicalize_blocks(blocks: list[dict], ix: MeshIndex, *,
             "explode": explode,
             "duis": sorted(set(duis)),
         })
-
-    if merge_slots:
-        # "other" is the slot for blocks nobody labelled — merging those would OR
-        # together facets that were meant to be ANDed (and silently broaden the
-        # search), so they stay separate.
-        merged: list[dict] = [dict(b) for b in staged if b["slot"] == "other"]
-        by_slot: dict[str, dict] = {}
-        for b in staged:
-            if b["slot"] == "other":
-                continue
-            cur = by_slot.get(b["slot"])
-            if cur is None:
-                by_slot[b["slot"]] = dict(b)
-                continue
-            cur["mesh"] = sort_terms(cur["mesh"] + b["mesh"])
-            cur["freetext"] = sort_terms(cur["freetext"] + b["freetext"])
-            cur["duis"] = sorted(set(cur["duis"]) | set(b["duis"]))
-            cur["explode"] = cur["explode"] and b["explode"]
-        staged = merged + list(by_slot.values())
-        for b in staged:                     # re-prune after the union
-            if prune and b["explode"] and len(b["duis"]) > 1:
-                b["duis"] = prune_subsumed(ix, b["duis"])
-                b["mesh"] = sort_terms(preferred_label(ix, d) for d in b["duis"])
 
     seen: set[tuple] = set()
     out: list[dict] = []

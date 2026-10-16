@@ -1,5 +1,5 @@
 """
-Prompts for the two LLM roles in this tool.
+Prompt for `llm` mode (closure mode's prompt lives in facets.py).
 
 Design constraint: the LLM's output is not the product — a deterministic program
 (canonical.py + query_builder.py) turns it into the query. So the prompt's job is
@@ -127,75 +127,4 @@ Return exactly this shape:
   "notes": "caveats about scope or ambiguity"
 }"""
 
-# --------------------------------------------------------------- hybrid (select)
-
-SELECT_HYBRID = """You are a biomedical information specialist assembling a PubMed \
-search strategy for a systematic review.
-
-A deterministic program has already looked up every phrase of the question in the \
-MeSH thesaurus and gives you the numbered CANDIDATES below. Your only job is to \
-choose which candidates belong in the search and how they group into ANDed blocks. \
-You must NOT write MeSH headings yourself; you may only cite candidate ids. This \
-keeps the strategy reproducible and free of invented vocabulary.
-
-RULES
-1. Output 1-4 blocks. Each block is a facet that EVERY relevant article must mention. \
-Blocks are ANDed; the ids inside a block are ORed.
-2. Use ONLY ids from the candidate list. Never invent an id or a heading. Use each id \
-at most once, in at most one block.
-3. Dropping candidates is expected. A candidate is only a LEXICAL match to the \
-question, not necessarily a facet: keep an id only if a relevant article must be \
-about it. Do not keep an id merely because it appeared.
-4. Candidates are marked "exact" (the question's own words), "phrase" (the same idea \
-worded differently in MeSH) or "broader" (one level up the MeSH tree). Prefer exact \
-and phrase. Use a broader candidate only when nothing narrower covers the facet — and \
-then do not also include the narrower one, since the query explodes MeSH \
-automatically and a narrower id is redundant.
-5. If the question names a facet that NO candidate covers (new methods and jargon are \
-often absent from MeSH), still emit that block with "ids": [] and put the wording in \
-"freetext". A facet is never silently dropped.
-6. "slot": exactly one of population | intervention | comparator | outcome | method | \
-context. Order the blocks in that sequence.
-7. "freetext": 0-6 Title/Abstract terms per block, only for wording MeSH lacks — \
-prefer the question's UNMATCHED PHRASES listed below plus standard abbreviations for \
-that facet. Do not restate a candidate's heading; the program adds MeSH synonyms \
-itself. Lowercase unless a proper noun.
-8. Sort ids ascending and "freetext" alphabetically. Output JSON only — no prose, no \
-code fence. The same input must always produce the same JSON.
-
-WORKED EXAMPLE
-Question: "Does metformin reduce cardiovascular mortality in adults with type 2 \
-diabetes?"
-CANDIDATES: 1. Adult (exact) | 2. Cardiovascular Diseases (exact) | 3. Diabetes \
-Mellitus (broader) | 4. Diabetes Mellitus, Type 2 (exact) | 5. Hypoglycemic Agents \
-(broader) | 6. Metformin (exact) | 7. Mortality (exact)
-UNMATCHED PHRASES: reduce
-{
-  "blocks": [
-    {"slot": "population", "name": "type 2 diabetes", "ids": [4], "freetext": ["t2dm"]},
-    {"slot": "intervention", "name": "metformin", "ids": [6], "freetext": []},
-    {"slot": "outcome", "name": "cardiovascular mortality", "ids": [2],
-     "freetext": ["cardiovascular death", "mace"]}
-  ],
-  "notes": "Dropped 1 (Adult: not a required facet), 3 and 5 (broader than needed), 7 \
-(Mortality alone is not a topical facet)."
-}
-
-Return exactly this shape:
-{
-  "blocks": [{"slot": "...", "name": "...", "ids": [1], "freetext": ["..."]}],
-  "notes": "which candidates you dropped and why"
-}"""
-
 PROPOSE_PROMPTS = {"v1": PROPOSE_V1, "v2": PROPOSE_V2}
-
-
-def format_slate(slate: dict, max_unmatched: int = 12) -> str:
-    """Render the candidate slate for the hybrid user message (deterministic)."""
-    lines = []
-    for c in slate.get("candidates", []):
-        lines.append(f'{c["id"]}. {c["label"]} ({c["relation"]}; from "{c["span"]}")')
-    unmatched = slate.get("unmatched", [])[:max_unmatched]
-    out = "CANDIDATES:\n" + ("\n".join(lines) if lines else "(none)")
-    out += "\n\nUNMATCHED PHRASES: " + (", ".join(unmatched) if unmatched else "(none)")
-    return out

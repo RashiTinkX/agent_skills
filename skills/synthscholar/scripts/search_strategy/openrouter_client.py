@@ -49,7 +49,7 @@ def _resolve_provider(model: str) -> tuple[dict, str]:
             return PROVIDERS[prefix], rest
     return _OPENROUTER, model
 
-from .prompts import PROPOSE_PROMPTS, PROPOSE_V1, SELECT_HYBRID, format_slate
+from .prompts import PROPOSE_PROMPTS, PROPOSE_V1
 
 # Kept for back-compat: the original single prompt. New callers pass
 # prompt_version="v2" (see prompts.py for why the rules changed).
@@ -68,8 +68,8 @@ TIMEOUT = float(os.environ.get("OPENROUTER_TIMEOUT", "180"))
 
 
 def _build_request(question, domains, model, extra_context, seed,
-                   system: str | None = None, slate_text: str = ""):
-    """Request assembly for map_question / select_candidates."""
+                   system: str | None = None):
+    """Request assembly for map_question."""
     model = model or DEFAULT_MODEL
     provider, upstream_model = _resolve_provider(model)
     key = provider.get("_api_key") or os.environ.get(provider["key_env"], "")
@@ -83,8 +83,6 @@ def _build_request(question, domains, model, extra_context, seed,
         user_msg += f"\nRelevant domains (favor their current jargon): {', '.join(domains)}\n"
     if extra_context:
         user_msg += f"\nAdditional scope notes:\n{extra_context}\n"
-    if slate_text:
-        user_msg += f"\n{slate_text}\n"
 
     payload = {
         "model": upstream_model,
@@ -145,33 +143,6 @@ def _parse_response(status: int, text: str, url: str, model: str) -> dict:
     return {"concepts": clean, "notes": str(parsed.get("notes", "")).strip(), "model": model}
 
 
-def _parse_selection(status: int, text: str, url: str, model: str) -> dict:
-    """
-    Normalize a hybrid selection response: blocks of candidate ids.
-
-    Ids that are not integers are dropped here; ids that are not in the slate are
-    dropped by the caller (pipeline.py), which owns the slate.
-    """
-    parsed = _loads_lenient(_content(status, text, url))
-    blocks = []
-    for b in parsed.get("blocks", parsed.get("concepts", [])):
-        if not isinstance(b, dict):
-            continue
-        ids: list[int] = []
-        for x in b.get("ids", b.get("candidates", [])) or []:
-            try:
-                ids.append(int(str(x).strip()))
-            except (TypeError, ValueError):
-                continue
-        blocks.append({
-            "name": str(b.get("name", "")).strip(),
-            "slot": str(b.get("slot", "")).strip(),
-            "ids": sorted(set(ids)),
-            "freetext": _strs(b.get("freetext")),
-        })
-    return {"blocks": blocks, "notes": str(parsed.get("notes", "")).strip(), "model": model}
-
-
 def _system_for(prompt_version: str | None) -> str:
     v = (prompt_version or DEFAULT_PROMPT_VERSION).lower()
     if v not in PROPOSE_PROMPTS:
@@ -197,19 +168,6 @@ def map_question(question: str, domains: list[str] | None = None,
         headers["Authorization"] = f"Bearer {api_key}"
     r = _post_sync(provider, payload, headers)
     return _parse_response(r.status_code, r.text, provider["url"], model or DEFAULT_MODEL)
-
-
-def select_candidates(question: str, slate: dict, domains: list[str] | None = None,
-                      model: str | None = None, api_key: str | None = None,
-                      extra_context: str = "", seed: int | None = None) -> dict:
-    """Hybrid mode (sync): pick blocks out of a deterministic candidate slate."""
-    provider, payload, headers = _build_request(
-        question, domains, model, extra_context, seed,
-        system=SELECT_HYBRID, slate_text=format_slate(slate))
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    r = _post_sync(provider, payload, headers)
-    return _parse_selection(r.status_code, r.text, provider["url"], model or DEFAULT_MODEL)
 
 
 def _loads_lenient(content: str) -> dict:
