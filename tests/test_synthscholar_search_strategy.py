@@ -418,6 +418,66 @@ class CoverageGapTests(unittest.TestCase):
 
 
 @needs_index
+class SegmentationFallbackTests(unittest.TestCase):
+    """A closure run whose samples all fail falls back to the offline heuristic;
+    that must never be recorded as model or agent output."""
+
+    Q = "Does metformin reduce cardiovascular mortality in patients with type 2 diabetes?"
+
+    def setUp(self):
+        import generate_search_strategy as gss
+        self.gss = gss
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _main(self, *argv) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        old = sys.argv
+        sys.argv = ["generate_search_strategy.py", *map(str, argv)]
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = self.gss.main()
+        finally:
+            sys.argv = old
+        return code, out.getvalue(), err.getvalue()
+
+    def test_unusable_agent_answers_stop_the_run(self):
+        samples = self.dir / "samples.json"
+        samples.write_text(json.dumps([[1, 2], "not json"]), encoding="utf-8")
+        code, out, err = self._main(self.Q, "--facet-samples", samples, "--model-name", "m", "--json")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("None of the answers", err)
+
+    def test_failed_model_calls_are_recorded_as_a_fallback(self):
+        def fail(*a, **k):
+            raise facets.FacetLLMError("LLM 401: bad key")
+        old_pass, old_key = facets._one_llm_pass, os.environ.get("OPENROUTER_API_KEY")
+        facets._one_llm_pass = fail
+        os.environ["OPENROUTER_API_KEY"] = "test"
+        try:
+            code, out, err = self._main(self.Q, "--json")
+        finally:
+            facets._one_llm_pass = old_pass
+            if old_key is None:
+                os.environ.pop("OPENROUTER_API_KEY", None)
+            else:
+                os.environ["OPENROUTER_API_KEY"] = old_key
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertEqual(result["provider"], "none (fallback)")
+        self.assertEqual(result["segmentation"]["mode"], "heuristic_fallback")
+        self.assertEqual(len(result["fallback"]["errors"]), 3)
+        self.assertIn("WARNING: model segmentation failed", err)
+        result.update(count=1, filters=result["filters"])
+        notes = self.gss._search_provenance(result)["searches"][0]["notes"]
+        self.assertIn("model segmentation FAILED", notes)
+
+
+@needs_index
 class SelfTest(unittest.TestCase):
     def test_engine_selftest_passes(self):
         from search_strategy import selftest
