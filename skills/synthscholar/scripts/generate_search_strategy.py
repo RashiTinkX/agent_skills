@@ -20,11 +20,12 @@ Three mapping modes (``--mode``):
   llm        the LLM proposes blocks and headings freely (comparison only).
   mesh_only  no LLM at all: every maximal MeSH match becomes a block.
 
-One-time setup — the MeSH index is built locally from NLM's RDF dump (the dump
-and the index are large and are not committed):
+MeSH index: built locally from NLM's RDF dump and not committed. The first run
+that needs it downloads the compressed dump (~120 MB, 1-2 minutes) and builds
+it automatically; ``--ensure-index`` does that up front and exits. To build
+from a dump you already have instead:
 
-    # download https://nlmpubs.nlm.nih.gov/projects/mesh/rdf/2026/mesh2026.nt.gz and gunzip
-    python generate_search_strategy.py --build-index /path/to/mesh.nt
+    python generate_search_strategy.py --build-index /path/to/mesh2026.nt[.gz]
 
 Usage:
     python generate_search_strategy.py "vocal biomarkers for depression"
@@ -51,6 +52,7 @@ Environment:
     OPENROUTER_MODEL     default model (else anthropic/claude-3.5-sonnet)
     NCBI_API_KEY         optional; raises the E-utilities rate limit
     NCBI_EMAIL           optional; NCBI asks for a contact address
+    SYNTHSCHOLAR_MESH_DB optional; use an existing MeSH index at this path
     CODEX_BIN, CODEX_MODEL  TEMP-CODEX: --provider codex only (codex_shim.py)
 
 Requires ``requests``.
@@ -58,6 +60,7 @@ Requires ``requests``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -91,6 +94,22 @@ def _emit_prompt(args: argparse.Namespace) -> dict:
         "next": (f'generate_search_strategy.py "<question>" --mode {args.mode} {flag} FILE '
                  "--model-name <your model id>"),
     }
+
+
+def _ensure_index() -> bool:
+    """Build the MeSH index if it is missing. Progress goes to stderr, so a
+    --json result on stdout stays parseable. False if it could not be built."""
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            built = build_index.ensure(DEFAULT_DB)
+    except RuntimeError as e:
+        print(f"MeSH index not available: {e}\n"
+              f"With a dump already on disk: generate_search_strategy.py --build-index "
+              f"/path/to/mesh{build_index.MESH_YEAR}.nt[.gz]", file=sys.stderr)
+        return False
+    if built:
+        print(f"MeSH index ready: {DEFAULT_DB}", file=sys.stderr)
+    return True
 
 
 def _load_samples(path: str) -> list[str]:
@@ -188,7 +207,9 @@ def main() -> int:
     # outputs
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     ap.add_argument("--build-index", default="", metavar="MESH_NT",
-                    help="build the local MeSH index from an NLM mesh.nt dump and exit")
+                    help="build the local MeSH index from an NLM mesh.nt(.gz) dump and exit")
+    ap.add_argument("--ensure-index", action="store_true",
+                    help="download and build the MeSH index if it is missing, and exit")
     # the host agent as the model
     ap.add_argument("--emit-prompt", action="store_true",
                     help="print the prompt for the host agent to answer, and exit")
@@ -203,8 +224,14 @@ def main() -> int:
     if args.build_index:
         build_index.build(args.build_index, DEFAULT_DB)
         return 0
+    if args.ensure_index:
+        if not _ensure_index():
+            return 2
+        print(f"MeSH index: {DEFAULT_DB} "
+              f"({build_index.index_descriptors(DEFAULT_DB):,} descriptors)")
+        return 0
     if not args.question.strip():
-        ap.error("a question is required (or use --build-index)")
+        ap.error("a question is required (or use --build-index / --ensure-index)")
     if args.emit_prompt:
         if args.mode == "mesh_only":
             ap.error("--mode mesh_only uses no model; there is no prompt to answer")
@@ -217,11 +244,7 @@ def main() -> int:
     agent = bool(args.facet_samples or args.llm_response)
     if agent and args.provider != "openrouter":
         ap.error("--provider is for calling a model; with agent answers no model is called")
-    if not os.path.exists(DEFAULT_DB) or os.path.getsize(DEFAULT_DB) == 0:
-        print(f"MeSH index not found at {DEFAULT_DB}.\n"
-              "Download https://nlmpubs.nlm.nih.gov/projects/mesh/rdf/2026/mesh2026.nt.gz, gunzip it, "
-              "then run:\n  python generate_search_strategy.py --build-index /path/to/mesh.nt",
-              file=sys.stderr)
+    if not _ensure_index():
         return 2
 
     model_label = None

@@ -11,9 +11,12 @@ as on CI.
 from __future__ import annotations
 
 import contextlib
+import gzip
 import io
 import os
+import sqlite3
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -120,6 +123,68 @@ class AgentSamplesTests(unittest.TestCase):
         messages = facets.facet_messages(self.Q)
         self.assertEqual(messages[0], {"role": "system", "content": facets.FACET_SYSTEM_PROMPT})
         self.assertEqual(messages[1], {"role": "user", "content": self.Q})
+
+
+class IndexBuildTests(unittest.TestCase):
+    """The MeSH index builds from the compressed dump, and the automatic
+    path leaves nothing half-built behind when it fails."""
+
+    # real lines from mesh2026.nt (D000001 Calcimycin), plus one altLabel
+    TRIPLES = """\
+<http://id.nlm.nih.gov/mesh/2026/D000001> <http://www.w3.org/2000/01/rdf-schema#label> "Calcimycin"@en .
+<http://id.nlm.nih.gov/mesh/2026/D000001> <http://id.nlm.nih.gov/mesh/vocab#treeNumber> <http://id.nlm.nih.gov/mesh/2026/D03.633.100.221.173> .
+<http://id.nlm.nih.gov/mesh/2026/D000001> <http://id.nlm.nih.gov/mesh/vocab#preferredConcept> <http://id.nlm.nih.gov/mesh/2026/M0000001> .
+<http://id.nlm.nih.gov/mesh/2026/M0000001> <http://id.nlm.nih.gov/mesh/vocab#preferredTerm> <http://id.nlm.nih.gov/mesh/2026/T000002> .
+<http://id.nlm.nih.gov/mesh/2026/T000002> <http://id.nlm.nih.gov/mesh/vocab#prefLabel> "Calcimycin"@en .
+<http://id.nlm.nih.gov/mesh/2026/T000002> <http://id.nlm.nih.gov/mesh/vocab#altLabel> "A23187"@en .
+"""
+
+    def setUp(self):
+        from search_strategy import build_index
+        self.build_index = build_index
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _gz(self) -> Path:
+        path = self.dir / "mesh_fixture.nt.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            fh.write(self.TRIPLES)
+        return path
+
+    def test_builds_from_gzipped_dump(self):
+        db = str(self.dir / "mesh.sqlite")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.build_index.build(str(self._gz()), db)
+        self.assertEqual(self.build_index.index_descriptors(db), 1)
+        con = sqlite3.connect(db)
+        try:
+            terms = {r[0] for r in con.execute("SELECT term FROM entry_term")}
+            trees = [r[0] for r in con.execute("SELECT tree FROM tree")]
+        finally:
+            con.close()
+        self.assertEqual(terms, {"Calcimycin", "A23187"})
+        self.assertEqual(trees, ["D03.633.100.221.173"])
+
+    def test_missing_or_partial_index_counts_as_absent(self):
+        self.assertEqual(self.build_index.index_descriptors(str(self.dir / "none.sqlite")), 0)
+        empty = self.dir / "empty.sqlite"
+        empty.write_bytes(b"")
+        self.assertEqual(self.build_index.index_descriptors(str(empty)), 0)
+
+    def test_ensure_rejects_a_too_small_dump_and_cleans_up(self):
+        db = self.dir / "mesh.sqlite"
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            self.build_index.ensure(str(db), url=self._gz().as_uri())
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["mesh_fixture.nt.gz"])
+
+    def test_ensure_failed_download_leaves_nothing(self):
+        db = self.dir / "mesh.sqlite"
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            self.build_index.ensure(str(db), url=(self.dir / "absent.nt.gz").as_uri())
+        self.assertEqual(list(self.dir.iterdir()), [])
 
 
 @needs_index

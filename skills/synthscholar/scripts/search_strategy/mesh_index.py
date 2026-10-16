@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = HERE  # data/ sits next to the modules in the skill layout
-DEFAULT_DB = os.path.join(ROOT, "data", "mesh.sqlite")
+# SYNTHSCHOLAR_MESH_DB points at an existing index elsewhere (same as build_index.py)
+DEFAULT_DB = os.environ.get("SYNTHSCHOLAR_MESH_DB") or os.path.join(ROOT, "data", "mesh.sqlite")
 
 
 def _norm(s: str) -> str:
@@ -36,7 +37,7 @@ class MeshIndex:
             raise FileNotFoundError(
                 f"MeSH index missing or empty at {db_path} "
                 f"(size={os.path.getsize(db_path) if os.path.exists(db_path) else 'absent'}). "
-                f"Rebuild it: python scripts/search_strategy/build_index.py"
+                f"Rebuild it: python scripts/generate_search_strategy.py --ensure-index"
             )
         self.db_path = db_path
         # sanity: the file must actually contain the schema (a truncated/partial
@@ -51,7 +52,7 @@ class MeshIndex:
         if missing:
             raise FileNotFoundError(
                 f"MeSH index at {db_path} is incomplete (missing tables: "
-                f"{', '.join(sorted(missing))}). Rebuild it: python scripts/search_strategy/build_index.py"
+                f"{', '.join(sorted(missing))}). Rebuild it: python scripts/generate_search_strategy.py --ensure-index"
             )
         # A single sqlite3 connection is NOT safe for concurrent use from
         # multiple threads (corrupts cursor state -> wrong rows or

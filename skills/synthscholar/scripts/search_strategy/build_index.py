@@ -1,7 +1,8 @@
 """
 Build a queryable SQLite index from the MeSH RDF N-Triples dump.
 
-One-time, streaming, pure-stdlib parse of mesh<YEAR>.nt. We only keep the
+One-time, streaming, pure-stdlib parse of mesh<YEAR>.nt (or .nt.gz, read
+compressed). We only keep the
 predicates needed to reconstruct, per topical descriptor (D...):
   - rdfs:label          -> the MeSH heading string
   - meshv:treeNumber    -> tree node(s), e.g. A01.923.047 (used for explosion)
@@ -21,21 +22,34 @@ Explosion is done at query time by dotted-prefix matching on `tree`
 (A01 explodes to A01, A01.111, A01.923.047, ...), which is exactly how MeSH
 "explode" works.
 
+`ensure()` is the automatic path: if the index is missing or broken it
+downloads NLM's compressed dump (~120 MB; the 2 GB .nt is never written),
+builds from it, checks the result and removes the download.
+
 Usage:
-    python build_index.py [path/to/mesh2025.nt] [path/to/mesh.sqlite]
+    python build_index.py [path/to/mesh2026.nt[.gz]] [path/to/mesh.sqlite]
 """
 from __future__ import annotations
 
+import gzip
 import os
+import shutil
 import sqlite3
 import sys
 import time
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = HERE  # data/ sits next to the modules in the skill layout
 
-DEFAULT_NT = os.path.join(ROOT, "mesh2025.nt")
-DEFAULT_DB = os.path.join(ROOT, "data", "mesh.sqlite")
+MESH_YEAR = 2026
+MESH_URL = f"https://nlmpubs.nlm.nih.gov/projects/mesh/rdf/{MESH_YEAR}/mesh{MESH_YEAR}.nt.gz"
+DEFAULT_NT = os.path.join(ROOT, f"mesh{MESH_YEAR}.nt")
+# SYNTHSCHOLAR_MESH_DB points at an existing index elsewhere (same as mesh_index.py)
+DEFAULT_DB = os.environ.get("SYNTHSCHOLAR_MESH_DB") or os.path.join(ROOT, "data", "mesh.sqlite")
+# A full MeSH year has ~31k descriptors; far fewer means a truncated download or
+# a partial dump, and an index built from it would silently miss headings.
+MIN_DESCRIPTORS = 30_000
 
 # predicate local-names we care about
 P_LABEL = "label"                 # rdfs:label
@@ -127,7 +141,8 @@ def build(nt_path: str, db_path: str) -> None:
     skipped_labels: list[tuple[str, str, str]] = []
 
     n = 0
-    with open(nt_path, "r", encoding="utf-8", errors="replace") as fh:
+    opener = gzip.open if nt_path.endswith(".gz") else open
+    with opener(nt_path, "rt", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             n += 1
             if n % 5_000_000 == 0:
@@ -225,6 +240,58 @@ def build(nt_path: str, db_path: str) -> None:
         f"{len(et_rows):,} entry terms -> {db_path} ({time.time() - t0:.0f}s total)",
         flush=True,
     )
+
+
+def index_descriptors(db_path: str = DEFAULT_DB) -> int:
+    """Descriptor count of a usable index at db_path, or 0 if there is none
+    (absent, empty, or missing a table -- e.g. an interrupted build)."""
+    if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
+        return 0
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            tables = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"descriptor", "tree", "entry_term"} <= tables:
+                return 0
+            return con.execute("SELECT count(*) FROM descriptor").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return 0
+
+
+def ensure(db_path: str = DEFAULT_DB, url: str = MESH_URL) -> bool:
+    """Make sure a usable index exists at db_path; download and build it if not.
+
+    Returns True if it was built now, False if one was already there. Raises
+    RuntimeError (leaving nothing half-built behind) if the download fails or
+    the result is too small to be a full MeSH year.
+    """
+    if index_descriptors(db_path) >= MIN_DESCRIPTORS:
+        return False
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    gz_path = db_path + ".download.nt.gz"
+    try:
+        print(f"Downloading MeSH {MESH_YEAR} from {url} (one-time, ~120 MB)", flush=True)
+        t0 = time.time()
+        req = urllib.request.Request(url, headers={"User-Agent": "synthscholar-search-strategy"})
+        with urllib.request.urlopen(req, timeout=120) as resp, open(gz_path, "wb") as out:
+            shutil.copyfileobj(resp, out, length=1 << 20)
+        print(f"  downloaded {os.path.getsize(gz_path) / 1e6:.0f} MB "
+              f"({time.time() - t0:.0f}s); building the index", flush=True)
+        build(gz_path, db_path)
+    except (OSError, EOFError, gzip.BadGzipFile) as e:
+        raise RuntimeError(f"could not download or read the MeSH dump from {url}: {e}") from e
+    finally:
+        if os.path.exists(gz_path):
+            os.remove(gz_path)
+    n = index_descriptors(db_path)
+    if n < MIN_DESCRIPTORS:
+        os.remove(db_path)
+        raise RuntimeError(f"MeSH index from {url} has only {n:,} descriptors "
+                           f"(expected >= {MIN_DESCRIPTORS:,}); removed it")
+    return True
 
 
 if __name__ == "__main__":
