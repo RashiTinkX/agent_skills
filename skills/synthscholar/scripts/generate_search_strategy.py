@@ -53,7 +53,6 @@ Environment:
     NCBI_API_KEY         optional; raises the E-utilities rate limit
     NCBI_EMAIL           optional; NCBI asks for a contact address
     SYNTHSCHOLAR_MESH_DB optional; use an existing MeSH index at this path
-    CODEX_BIN, CODEX_MODEL  TEMP-CODEX: --provider codex only (codex_shim.py)
 
 Requires ``requests``.
 """
@@ -256,9 +255,6 @@ def main() -> int:
     ap.add_argument("--mode", default="closure", choices=pipeline.MODES,
                     help="mapping mode (default: closure)")
     ap.add_argument("--model", default=None, help="model id (default: $OPENROUTER_MODEL)")
-    # TEMP-CODEX: answer the LLM calls with the local Codex CLI (codex_shim.py)
-    ap.add_argument("--provider", default="openrouter", choices=("openrouter", "codex"),
-                    help="who answers the LLM calls (default openrouter; codex is temporary)")
     ap.add_argument("--facet-runs", type=int, default=3, metavar="K",
                     help="closure mode: samples for self-consistency voting (default 3)")
     ap.add_argument("--domains", nargs="*", default=[],
@@ -322,16 +318,8 @@ def main() -> int:
     if args.llm_response and args.mode != "llm":
         ap.error("--llm-response is for --mode llm")
     agent = bool(args.facet_samples or args.llm_response)
-    if agent and args.provider != "openrouter":
-        ap.error("--provider is for calling a model; with agent answers no model is called")
     if not _ensure_index():
         return 2
-
-    model_label = None
-    if args.provider == "codex":  # TEMP-CODEX
-        from search_strategy import codex_shim
-        codex_shim.install()
-        model_label = f"codex/{os.environ.get('CODEX_MODEL') or 'default'}"
 
     try:
         samples = _load_samples(args.facet_samples) if args.facet_samples else None
@@ -380,8 +368,7 @@ def main() -> int:
     elif agent:
         provider, model = "agent", args.model_name or "unspecified"
     else:
-        # TEMP-CODEX: model_label -- the engine does not know Codex answered
-        provider, model = args.provider, model_label or args.model or facets.DEFAULT_MODEL
+        provider, model = "openrouter", args.model or facets.DEFAULT_MODEL
 
     filters = _filters(args)
     try:
@@ -406,8 +393,8 @@ def main() -> int:
         # the voted spans the vocabulary was resolved from (and how many samples agreed)
         result["segmentation"] = built["segmentation"]
     if fallback:
-        result["fallback"] = {"requested_provider": args.provider,
-                              "requested_model": model_label or args.model or facets.DEFAULT_MODEL,
+        result["fallback"] = {"requested_provider": "openrouter",
+                              "requested_model": args.model or facets.DEFAULT_MODEL,
                               "errors": seg.get("errors") or []}
 
     if args.count or args.fetch is not None or args.provenance_out:
