@@ -114,11 +114,24 @@ class PubMed:
 
     # ---- search -------------------------------------------------------
 
+    @staticmethod
+    def _esearch(r) -> dict:
+        """The `esearchresult` of an esearch reply. NCBI occasionally answers 200
+        with an error page or a body without it; that is a RuntimeError like any
+        other failed request, not a KeyError."""
+        try:
+            data = r.json()["esearchresult"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise RuntimeError(f"unexpected NCBI esearch response: {r.text[:200]!r}") from e
+        if not isinstance(data, dict):
+            raise RuntimeError(f"unexpected NCBI esearch response: {r.text[:200]!r}")
+        return data
+
     def search(self, query: str) -> dict:
         """esearch with history server. Returns count, webenv, query_key, translation."""
         params = self._params(db="pubmed", term=query, usehistory="y", retmode="json", retmax=0)
         r = self._request("esearch.fcgi", params, method="POST")
-        data = r.json()["esearchresult"]
+        data = self._esearch(r)
         return {
             "count": int(data.get("count", 0)),
             "webenv": data.get("webenv", ""),
@@ -133,7 +146,7 @@ class PubMed:
     def count(self, query: str) -> int:
         params = self._params(db="pubmed", term=query, retmode="json", retmax=0)
         r = self._request("esearch.fcgi", params, method="POST")
-        return int(r.json()["esearchresult"].get("count", 0))
+        return int(self._esearch(r).get("count", 0))
 
     @staticmethod
     def _scope(query: str, lo: date, hi: date) -> str:
@@ -197,7 +210,7 @@ class PubMed:
                 params = self._params(db="pubmed", term=sl["query"], retmode="json",
                                       retstart=start, retmax=n)
                 r = self._request("esearch.fcgi", params, method="POST")
-                ids = r.json()["esearchresult"].get("idlist", [])
+                ids = self._esearch(r).get("idlist", [])
                 out.extend(ids)
                 if len(ids) < n:
                     break
@@ -294,7 +307,10 @@ class PubMed:
 
     @classmethod
     def _parse(cls, xml_bytes: bytes) -> list[Article]:
-        root = ET.fromstring(xml_bytes)
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError as e:            # an HTML error page instead of efetch XML
+            raise RuntimeError(f"unexpected NCBI efetch response: {xml_bytes[:200]!r}") from e
         articles: list[Article] = []
         for pa in root.findall(".//PubmedArticle"):
             art = Article()

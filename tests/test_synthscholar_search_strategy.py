@@ -418,6 +418,21 @@ class DateSlicingTests(unittest.TestCase):
         self.assertEqual([(s["from"], s["truncated"]) for s in over], [("2021/05/05", True)])
         self.assertTrue(all(not s["truncated"] for s in slices if s["count"] <= 9_999))
 
+    def test_unexpected_ncbi_replies_are_runtime_errors(self):
+        from search_strategy.pubmed import PubMed
+
+        class Reply:
+            def __init__(self, text):
+                self.text = text
+
+            def json(self):
+                return json.loads(self.text)
+        for body in ('{"header": {}}', "<html>Service unavailable</html>", '{"esearchresult": []}'):
+            with self.subTest(body=body), self.assertRaises(RuntimeError):
+                PubMed._esearch(Reply(body))
+        with self.assertRaises(RuntimeError):
+            PubMed._parse(b"<html><body>error</body>")
+
     def test_slicing_is_deterministic(self):
         from datetime import date, timedelta
         dates = [date(2000, 1, 1) + timedelta(days=(i * 7) % 9000) for i in range(25_000)]
@@ -618,6 +633,27 @@ class SegmentationFallbackTests(unittest.TestCase):
             self.gss._pubmed = old
         self.assertEqual(code, 3)
         self.assertIn("PubMed request failed", err)
+
+    def test_unwritable_outdir_is_not_a_pubmed_error(self):
+        class Up:
+            def search(self, query):
+                return {"count": 1, "translation": "", "warnings": {}, "errors": {}}
+
+            def fetch_query(self, query, max_records=None):
+                return {"articles": [], "count": 1, "fetched": 0, "slices": [{}],
+                        "capped": False, "missing": 1}
+        blocker = self.dir / "a_file"
+        blocker.write_text("x", encoding="utf-8")       # --outdir under a file: mkdir fails
+        old = self.gss._pubmed
+        self.gss._pubmed = lambda: Up()
+        try:
+            code, out, err = self._main(self.Q, "--mode", "mesh_only", "--fetch", "0",
+                                        "--outdir", blocker / "sub")
+        finally:
+            self.gss._pubmed = old
+        self.assertEqual(code, 4)
+        self.assertIn("fetch succeeded but could not write", err)
+        self.assertNotIn("PubMed request failed", err)
 
 
 @needs_index

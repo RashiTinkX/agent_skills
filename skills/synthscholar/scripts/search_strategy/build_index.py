@@ -235,8 +235,11 @@ def build(nt_path: str, db_path: str) -> None:
         con.execute("VACUUM")
         con.commit()
     except BaseException:
-        con.close()
-        os.remove(tmp_path)              # never leave a half-built index behind
+        try:
+            con.close()
+        finally:                         # never leave a half-built index behind
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
         raise
     con.close()
     os.replace(tmp_path, db_path)

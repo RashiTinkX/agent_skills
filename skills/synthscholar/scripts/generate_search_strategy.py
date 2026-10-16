@@ -140,6 +140,11 @@ def _pubmed() -> PubMed:
                   email=os.environ.get("NCBI_EMAIL", ""))
 
 
+class _OutputError(Exception):
+    """A local write failed (unwritable --outdir, full disk): not a PubMed error,
+    so it must not be reported as one -- retrying the network would not help."""
+
+
 def _fetch(pm: PubMed, query: str, search: dict, max_records: int, outdir: Path) -> dict:
     """Mirror of the web app's /api/search: records + an audit protocol.json."""
     # fetch_query, not fetch_all: past 9,999 records NCBI's history server refuses
@@ -149,9 +154,12 @@ def _fetch(pm: PubMed, query: str, search: dict, max_records: int, outdir: Path)
     qhash = query_builder.query_hash(query)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     folder = outdir / f"{stamp}_{qhash}"
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "results.csv").write_text(to_csv(articles), encoding="utf-8")
-    (folder / "results.jsonl").write_text(to_jsonl(articles), encoding="utf-8")
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "results.csv").write_text(to_csv(articles), encoding="utf-8")
+        (folder / "results.jsonl").write_text(to_jsonl(articles), encoding="utf-8")
+    except OSError as e:
+        raise _OutputError(f"could not write {len(articles)} records to {folder}: {e}") from e
     protocol = {
         "query": query,
         "query_hash": qhash,
@@ -166,7 +174,10 @@ def _fetch(pm: PubMed, query: str, search: dict, max_records: int, outdir: Path)
         "records_unaccounted": fetched["missing"],
         "timestamp": stamp,
     }
-    (folder / "protocol.json").write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+    try:
+        (folder / "protocol.json").write_text(json.dumps(protocol, indent=2), encoding="utf-8")
+    except OSError as e:
+        raise _OutputError(f"could not write {folder / 'protocol.json'}: {e}") from e
     return {**protocol, "folder": str(folder)}
 
 
@@ -408,13 +419,21 @@ def main() -> int:
             if args.fetch is not None and search["count"]:
                 result["fetch"] = _fetch(pm, compiled["query"], search, args.fetch,
                                          Path(args.outdir))
+        except _OutputError as e:
+            print(f"The PubMed fetch succeeded but {e}.\nFree disk space or pass a writable "
+                  "--outdir, then run again.", file=sys.stderr)
+            return 4
         except (OSError, RuntimeError) as e:     # requests errors are OSErrors
             print(f"PubMed request failed: {e}\nThe query compiled (hash {compiled['hash']}); "
                   "retry later, or set NCBI_API_KEY for a higher rate limit.", file=sys.stderr)
             return 3
     if args.provenance_out:
-        Path(args.provenance_out).write_text(
-            json.dumps(_search_provenance(result), indent=2), encoding="utf-8")
+        try:
+            Path(args.provenance_out).write_text(
+                json.dumps(_search_provenance(result), indent=2), encoding="utf-8")
+        except OSError as e:
+            print(f"Could not write {args.provenance_out}: {e}", file=sys.stderr)
+            return 4
         result["provenance_out"] = args.provenance_out
 
     if args.json:
