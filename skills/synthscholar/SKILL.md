@@ -594,7 +594,7 @@ step can't run and carry on with the rest.
 | `query_sparql.py` | `rdflib` | `python -c "import rdflib"` | `pip install rdflib` |
 | `query_postgres.py`, `backfill_full_text.py` | `psycopg` | `python -c "import psycopg"` | `pip install "psycopg[binary]>=3.1"` |
 | `build_corpus.py` | `pymupdf`; `docling` optional | `python -c "import fitz"` | `pip install pymupdf` (+ `pip install docling` for scans/tables) |
-| `export_review.py`, `run_local_review.py`, `update_provenance.py` | `synthscholar` dev checkout | the script refuses with a message | `pip install -e /path/to/prisma-review-agent` (ask for the path) |
+| `export_review.py`, `run_local_review.py`, `update_provenance.py` | `synthscholar` dev checkout | the script refuses with a message | `git clone https://github.com/sensein/synthscholar`, `git -C synthscholar checkout improve_verification` (`main` lacks the fields), `pip install -e ./synthscholar` |
 | `generate_review_pdf.py` | `pandoc` + a **TeX engine** (xelatex, lualatex, pdflatex or tectonic) for the ACM layout; `rsvg-convert` (or `cairosvg`/`typst`) to convert SVG figures for TeX; `fc-list` optional. Without TeX: `typst` or an HTML engine, plain layout only | `python scripts/generate_review_pdf.py --check-deps` (also finds a TeX Live/MacTeX install that is not on `PATH`) | TeX: `brew install --cask mactex-no-gui` (macOS), `apt-get install texlive-xetex texlive-fonts-extra texlive-latex-extra` (Debian/Ubuntu), or `conda install -c conda-forge tectonic` (smallest; fetches packages once into its cache). Then `conda install -c conda-forge pandoc librsvg` (or `brew install pandoc librsvg`). The ACM class itself is bundled in `assets/acmart/` |
 | `generate_search_strategy.py` | `requests`; the MeSH index (built automatically on first use, ~120 MB download) | `python -c "import requests"` | `pip install requests` |
 | `validate_protocol.py`, `research_questions.py`, `check_writing.py`, `review_figures.py`, `assemble_manuscript.py`, `screen_records.py` | stdlib | — | — |
@@ -614,7 +614,9 @@ extraction backend `build_corpus.py` reaches for; without it the script says so
 and uses the PyMuPDF chain, and `--no-docling` skips it deliberately.
 
 **`export_review.py` and `run_local_review.py` need the development checkout,
-not the released package** — `pip install -e /path/to/prisma-review-agent`. The
+not the released package** — clone `https://github.com/sensein/synthscholar`, check out
+the `improve_verification` branch (`main` lacks the provenance fields), and
+`pip install -e ./synthscholar`. The
 PyPI build predates the whole-document reading and screening-basis provenance,
 and they refuse to run on it rather than silently dropping those fields.
 `fetch_ezproxy.py` and `verify_citations.py` work anywhere — they need only `httpx`, since the skill

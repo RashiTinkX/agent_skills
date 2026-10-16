@@ -180,8 +180,13 @@ released package** — PyPI's latest (0.0.11) predates the whole-document readin
 full-text screening and retrieval-provenance work:
 
 ```bash
-pip install -e /path/to/prisma-review-agent    # the checkout, not `pip install synthscholar`
+git clone https://github.com/sensein/synthscholar
+git -C synthscholar checkout improve_verification   # main does not yet carry these fields
+pip install -e "./synthscholar[fulltext]"            # the checkout, not `pip install synthscholar`
 ```
+
+The checkout used to be called `prisma-review-agent`. Use the `improve_verification`
+branch: `main` predates the provenance fields, and the scripts below refuse it.
 
 | Script | Runs on released 0.0.11? |
 | --- | --- |

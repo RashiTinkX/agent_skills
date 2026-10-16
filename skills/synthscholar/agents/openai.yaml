@@ -47,7 +47,7 @@ dependencies:
   # it rather than silently dropping those fields.
   synthscholar:
     released: "pip install 'synthscholar[fulltext]'   # sufficient for Modes 1-2"
-    development: "pip install -e /path/to/prisma-review-agent   # required for Mode 3"
+    development: "git clone https://github.com/sensein/synthscholar && git -C synthscholar checkout improve_verification && pip install -e ./synthscholar   # required for Mode 3; main lacks the provenance fields"
 
   # Which scripts need which of the above.
   scripts:

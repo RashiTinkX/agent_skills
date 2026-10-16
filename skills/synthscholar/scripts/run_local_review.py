@@ -524,7 +524,9 @@ def main() -> int:
         print("The installed synthscholar has no synthscholar/text_windows.py, so "
               "evidence extraction would read only the opening pages of each "
               "article. Install the development checkout:\n"
-              "  pip install -e /path/to/prisma-review-agent", file=sys.stderr)
+              "  git clone https://github.com/sensein/synthscholar\n"
+              "  git -C synthscholar checkout improve_verification   # main lacks these fields\n"
+              "  pip install -e ./synthscholar", file=sys.stderr)
         return 3
 
     return asyncio.run(run(args))
