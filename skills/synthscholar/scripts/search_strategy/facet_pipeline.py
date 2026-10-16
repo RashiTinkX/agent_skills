@@ -1,7 +1,7 @@
 """
 Wires facets.py (self-consistency span voting) + closure.py (deterministic
 MeSH closure) into the same {"concepts", "notes", "model"} shape
-openrouter_client.map_question(_async) already returns, so the CLI's
+openrouter_client.map_question already returns, so the CLI's
 `resolve_concepts`/frontend contract needs no change to support a new mode.
 
 Mode name: "closure". Kept alongside the existing single-shot "llm" mode
@@ -127,15 +127,5 @@ def build(question: str, ix: MeshIndex, *, model: str | None = None,
          max_freetext: int | None = None) -> dict:
     seg = facets.segment(question, model=model, api_key=api_key, k=k,
                          use_llm=use_llm, min_agreement=min_agreement)
-    return _finish(question, ix, seg, model, min_agreement=min_agreement,
-                   explode=explode, max_freetext=max_freetext)
-
-
-async def build_async(question: str, ix: MeshIndex, *, model: str | None = None,
-                      api_key: str | None = None, k: int = 3, use_llm: bool = True,
-                      min_agreement: float = 0.5, explode: bool = True,
-                      max_freetext: int | None = None) -> dict:
-    seg = await facets.segment_async(question, model=model, api_key=api_key, k=k,
-                                     use_llm=use_llm, min_agreement=min_agreement)
     return _finish(question, ix, seg, model, min_agreement=min_agreement,
                    explode=explode, max_freetext=max_freetext)

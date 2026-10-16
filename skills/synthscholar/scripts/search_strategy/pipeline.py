@@ -38,9 +38,7 @@ from .mesh_index import get_index
 from .openrouter_client import (
     OpenRouterError,
     map_question,
-    map_question_async,
     select_candidates,
-    select_candidates_async,
 )
 
 MODES = ("llm", "hybrid", "closure", "mesh_only")
@@ -146,7 +144,7 @@ def _blocks_from_selection(selection: dict, slate: dict, *,
 
 def _blocks_from_closure(concepts: list[dict]) -> list[dict]:
     """
-    closure mode (facet_pipeline.build/build_async) -> canonicaliser input.
+    closure mode (facet_pipeline.build) -> canonicaliser input.
 
     facet_pipeline's concepts already carry resolved MeSH rows (each with its
     own single, exactly-matched descriptor -- see closure.py), so this is a
@@ -280,66 +278,6 @@ def build(question: str, *, domains: list[str] | None = None, mode: str = "llm",
         try:
             raw = select_candidates(question, slate, domains=domains, model=model,
                                     api_key=api_key, extra_context=extra_context, seed=seed)
-            notes = raw.get("notes", "")
-            blocks, bad_ids = _blocks_from_selection(
-                raw, slate, group_by_span=group_by_span, closure=closure)
-        except OpenRouterError:
-            if not fallback:
-                raise
-            blocks, notes = mesh_only_blocks(question, ix), "LLM selection failed; mesh_only fallback."
-            fell_back = True
-        if not blocks and fallback:
-            blocks = mesh_only_blocks(question, ix)
-            notes = (notes + " | empty selection; mesh_only fallback.").strip(" |")
-            fell_back = True
-
-    # Slot merging is OFF by default: models label the same content with different
-    # slots ("Microglia" came back as population, context AND intervention across
-    # models), so merging on that field lets the least reliable part of the answer
-    # change what is ANDed vs ORed. Never merge the fallback's unslotted blocks.
-    res = _assemble(blocks, domains,
-                    merge_slots=(merge_slots and mode == "hybrid" and not fell_back),
-                    strict=strict, ix=ix)
-    return {**res, "mode": mode, "model": raw.get("model") or model or "",
-            "prompt_version": (prompt_version or "v2") if mode == "llm" else mode,
-            "notes": notes, "slate": slate, "raw": raw, "invalid_ids": bad_ids}
-
-
-async def build_async(question: str, *, domains: list[str] | None = None, mode: str = "llm",
-                      model: str | None = None, api_key: str | None = None,
-                      extra_context: str = "", seed: int | None = None,
-                      prompt_version: str | None = None, strict: bool = True,
-                      fallback: bool = True, merge_slots: bool = False,
-                      group_by_span: bool = True,
-                      closure: bool = True, facet_runs: int = 3) -> dict:
-    """Async build (FastAPI endpoint)."""
-    mode = _check_mode(mode)
-    ix = get_index()
-    slate: dict = {}
-    raw: dict = {}
-    notes = ""
-    bad_ids: list[int] = []
-    fell_back = False
-
-    if mode == "mesh_only":
-        blocks = mesh_only_blocks(question, ix)
-    elif mode == "llm":
-        raw = await map_question_async(question, domains=domains, model=model, api_key=api_key,
-                                       extra_context=extra_context, seed=seed,
-                                       prompt_version=prompt_version)
-        notes = raw.get("notes", "")
-        blocks = _blocks_from_concepts(raw["concepts"])
-    elif mode == "closure":
-        fp = await facet_pipeline.build_async(question, ix, model=model, api_key=api_key,
-                                              k=facet_runs)
-        notes = fp["notes"]
-        blocks = _blocks_from_closure(fp["concepts"])
-    else:
-        slate = candidate_slate(question, ix)
-        try:
-            raw = await select_candidates_async(question, slate, domains=domains, model=model,
-                                                api_key=api_key, extra_context=extra_context,
-                                                seed=seed)
             notes = raw.get("notes", "")
             blocks, bad_ids = _blocks_from_selection(
                 raw, slate, group_by_span=group_by_span, closure=closure)

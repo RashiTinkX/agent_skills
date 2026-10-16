@@ -69,7 +69,7 @@ TIMEOUT = float(os.environ.get("OPENROUTER_TIMEOUT", "180"))
 
 def _build_request(question, domains, model, extra_context, seed,
                    system: str | None = None, slate_text: str = ""):
-    """Shared request assembly for the sync and async paths."""
+    """Request assembly for map_question / select_candidates."""
     model = model or DEFAULT_MODEL
     provider, upstream_model = _resolve_provider(model)
     key = provider.get("_api_key") or os.environ.get(provider["key_env"], "")
@@ -186,15 +186,6 @@ def _post_sync(provider, payload, headers):
         raise OpenRouterError(f"LLM request failed ({provider['url']}): {e}") from e
 
 
-async def _post_async(provider, payload, headers):
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
-            return await client.post(provider["url"], headers=headers, json=payload)
-    except httpx.HTTPError as e:
-        raise OpenRouterError(f"LLM request failed ({provider['url']}): {e}") from e
-
-
 def map_question(question: str, domains: list[str] | None = None,
                  model: str | None = None, api_key: str | None = None,
                  extra_context: str = "", seed: int | None = None,
@@ -208,19 +199,6 @@ def map_question(question: str, domains: list[str] | None = None,
     return _parse_response(r.status_code, r.text, provider["url"], model or DEFAULT_MODEL)
 
 
-async def map_question_async(question: str, domains: list[str] | None = None,
-                             model: str | None = None, api_key: str | None = None,
-                             extra_context: str = "", seed: int | None = None,
-                             prompt_version: str | None = None) -> dict:
-    """Async map (used by the FastAPI endpoint so the event loop isn't blocked)."""
-    provider, payload, headers = _build_request(
-        question, domains, model, extra_context, seed, system=_system_for(prompt_version))
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    r = await _post_async(provider, payload, headers)
-    return _parse_response(r.status_code, r.text, provider["url"], model or DEFAULT_MODEL)
-
-
 def select_candidates(question: str, slate: dict, domains: list[str] | None = None,
                       model: str | None = None, api_key: str | None = None,
                       extra_context: str = "", seed: int | None = None) -> dict:
@@ -231,19 +209,6 @@ def select_candidates(question: str, slate: dict, domains: list[str] | None = No
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     r = _post_sync(provider, payload, headers)
-    return _parse_selection(r.status_code, r.text, provider["url"], model or DEFAULT_MODEL)
-
-
-async def select_candidates_async(question: str, slate: dict, domains: list[str] | None = None,
-                                  model: str | None = None, api_key: str | None = None,
-                                  extra_context: str = "", seed: int | None = None) -> dict:
-    """Hybrid mode (async) — used by the FastAPI endpoint."""
-    provider, payload, headers = _build_request(
-        question, domains, model, extra_context, seed,
-        system=SELECT_HYBRID, slate_text=format_slate(slate))
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    r = await _post_async(provider, payload, headers)
     return _parse_selection(r.status_code, r.text, provider["url"], model or DEFAULT_MODEL)
 
 

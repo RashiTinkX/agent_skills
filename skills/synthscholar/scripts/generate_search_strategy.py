@@ -40,7 +40,7 @@ Environment:
     NCBI_API_KEY         optional; raises the E-utilities rate limit
     NCBI_EMAIL           optional; NCBI asks for a contact address
 
-Requires ``requests`` and ``httpx``.
+Requires ``requests``.
 """
 from __future__ import annotations
 
