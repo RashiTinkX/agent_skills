@@ -124,8 +124,14 @@ def _finish(question: str, ix: MeshIndex, seg: dict, model: str | None, *,
 def build(question: str, ix: MeshIndex, *, model: str | None = None,
          api_key: str | None = None, k: int = 3, use_llm: bool = True,
          min_agreement: float = 0.5, explode: bool = True,
-         max_freetext: int | None = None) -> dict:
-    seg = facets.segment(question, model=model, api_key=api_key, k=k,
-                         use_llm=use_llm, min_agreement=min_agreement)
+         max_freetext: int | None = None,
+         samples: list[str] | None = None) -> dict:
+    """samples: the k segmentation answers, when the host agent produced them
+    (facets.segment_from_samples); otherwise the model is called here."""
+    if samples is not None:
+        seg = facets.segment_from_samples(question, samples, min_agreement)
+    else:
+        seg = facets.segment(question, model=model, api_key=api_key, k=k,
+                             use_llm=use_llm, min_agreement=min_agreement)
     return _finish(question, ix, seg, model, min_agreement=min_agreement,
                    explode=explode, max_freetext=max_freetext)

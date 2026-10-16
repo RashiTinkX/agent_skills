@@ -90,6 +90,38 @@ class VotingTests(unittest.TestCase):
         self.assertEqual(seg["facets"], facets.heuristic_facets(q))
 
 
+class AgentSamplesTests(unittest.TestCase):
+    """The host agent as the model: its answers go through the same parse and
+    vote as an OpenRouter reply (facets.segment_from_samples)."""
+
+    Q = "Does metformin reduce cardiovascular mortality in patients with type 2 diabetes?"
+    ANSWER = ('{"facets": [{"text": "metformin", "role": "intervention"}, '
+              '{"text": "cardiovascular mortality", "role": "outcome"}, '
+              '{"text": "patients with type 2 diabetes", "role": "population"}]}')
+
+    def test_samples_vote_like_model_replies(self):
+        parsed = [facets._parse_facet_response(self.Q, self.ANSWER)] * 3
+        expected = facets._vote_or_fallback(self.Q, parsed, [], 0.5)
+        got = facets.segment_from_samples(self.Q, [self.ANSWER] * 3)
+        self.assertEqual(got, expected)
+        self.assertEqual(got["mode"], "llm_voted")
+        self.assertEqual([f["name"] for f in got["facets"]],
+                         ["metformin", "cardiovascular mortality",
+                          "patients with type 2 diabetes"])
+
+    def test_malformed_answer_is_a_failed_sample(self):
+        got = facets.segment_from_samples(
+            self.Q, ['{"facets": [', "no json here", self.ANSWER])
+        self.assertEqual(got["mode"], "llm_voted")
+        self.assertEqual(got["runs"], 1)
+        self.assertEqual(len(got["errors"]), 2)
+
+    def test_prompt_is_the_one_sent_to_openrouter(self):
+        messages = facets.facet_messages(self.Q)
+        self.assertEqual(messages[0], {"role": "system", "content": facets.FACET_SYSTEM_PROMPT})
+        self.assertEqual(messages[1], {"role": "user", "content": self.Q})
+
+
 @needs_index
 class ClosureTests(unittest.TestCase):
     def setUp(self):

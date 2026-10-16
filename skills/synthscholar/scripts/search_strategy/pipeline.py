@@ -30,7 +30,7 @@ from . import canonical, facet_pipeline
 from .candidates import mesh_only_blocks
 from .domain_vocab import get_vocab
 from .mesh_index import get_index
-from .openrouter_client import map_question
+from .openrouter_client import map_question, parse_proposal
 
 MODES = ("closure", "llm", "mesh_only")
 
@@ -162,26 +162,37 @@ def build(question: str, *, domains: list[str] | None = None, mode: str = "closu
           model: str | None = None, api_key: str | None = None,
           extra_context: str = "", seed: int | None = None,
           strict: bool = True,
-          facet_runs: int = 3) -> dict:
-    """Question -> canonical concept blocks (CLI / self-test)."""
+          facet_runs: int = 3, facet_samples: list[str] | None = None,
+          llm_response: str | None = None) -> dict:
+    """Question -> canonical concept blocks (CLI / self-test).
+
+    facet_samples (closure) / llm_response (llm): the model's answers when the
+    host agent produced them itself; then no model is called here.
+    """
     mode = _check_mode(mode)
     ix = get_index()
     raw: dict = {}
     notes = ""
+    seg: dict = {}
 
     if mode == "mesh_only":
         blocks = mesh_only_blocks(question, ix)
     elif mode == "llm":
-        raw = map_question(question, domains=domains, model=model, api_key=api_key,
-                           extra_context=extra_context, seed=seed)
+        if llm_response is not None:
+            raw = parse_proposal(llm_response, model or "")
+        else:
+            raw = map_question(question, domains=domains, model=model, api_key=api_key,
+                               extra_context=extra_context, seed=seed)
         notes = raw.get("notes", "")
         blocks = _blocks_from_concepts(raw["concepts"])
     else:
-        fp = facet_pipeline.build(question, ix, model=model, api_key=api_key, k=facet_runs)
+        fp = facet_pipeline.build(question, ix, model=model, api_key=api_key, k=facet_runs,
+                                  samples=facet_samples)
         notes = fp["notes"]
+        seg = fp["segmentation"]
         blocks = _blocks_from_closure(fp["concepts"])
 
     res = _assemble(blocks, domains, strict=strict, ix=ix)
     return {**res, "mode": mode, "model": raw.get("model") or model or "",
             "prompt_version": "v2" if mode == "llm" else mode,
-            "notes": notes, "raw": raw}
+            "notes": notes, "raw": raw, "segmentation": seg}

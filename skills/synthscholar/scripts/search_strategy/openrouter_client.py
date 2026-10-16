@@ -64,6 +64,19 @@ MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "8000"))
 TIMEOUT = float(os.environ.get("OPENROUTER_TIMEOUT", "180"))
 
 
+def propose_messages(question: str, domains: list[str] | None = None,
+                     extra_context: str = "", *, system: str | None = None) -> list[dict]:
+    """The chat messages an llm-mode proposal is answered from -- the same for
+    OpenRouter and for a host agent answering them itself."""
+    user_msg = f"Research question / topic:\n{question}\n"
+    if domains:
+        user_msg += f"\nRelevant domains (favor their current jargon): {', '.join(domains)}\n"
+    if extra_context:
+        user_msg += f"\nAdditional scope notes:\n{extra_context}\n"
+    return [{"role": "system", "content": system or SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg}]
+
+
 def _build_request(question, domains, model, extra_context, seed,
                    system: str | None = None):
     """Request assembly for map_question."""
@@ -75,12 +88,6 @@ def _build_request(question, domains, model, extra_context, seed,
             f"{provider['key_env']} is not set. Export it or paste it in the UI settings."
         )
 
-    user_msg = f"Research question / topic:\n{question}\n"
-    if domains:
-        user_msg += f"\nRelevant domains (favor their current jargon): {', '.join(domains)}\n"
-    if extra_context:
-        user_msg += f"\nAdditional scope notes:\n{extra_context}\n"
-
     payload = {
         "model": upstream_model,
         "temperature": 0,
@@ -88,10 +95,7 @@ def _build_request(question, domains, model, extra_context, seed,
         # honours it; sending both removes one source of sampling drift.
         "top_p": 1,
         "max_tokens": MAX_TOKENS,
-        "messages": [
-            {"role": "system", "content": system or SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
+        "messages": propose_messages(question, domains, extra_context, system=system),
         "response_format": {"type": "json_object"},
     }
     if seed is not None:  # best-effort; ignored by providers that don't support it
@@ -122,13 +126,19 @@ def _strs(seq) -> list[str]:
 
 def _parse_response(status: int, text: str, url: str, model: str) -> dict:
     """Turn a raw HTTP response into the normalized concept dict (or raise)."""
-    parsed = _loads_lenient(_content(status, text, url))
+    return parse_proposal(_content(status, text, url), model)
+
+
+def parse_proposal(content: str, model: str) -> dict:
+    """Model answer (the message content) -> normalized concept dict, or raise.
+    Shared by the OpenRouter path and a host agent's own answer."""
+    parsed = _loads_lenient(content)
     clean = []
     for c in parsed.get("concepts", []):
         if not isinstance(c, dict):
             continue
-        # v2 asks for "mesh"; v1 asked for "mesh_candidates". Accept both so the
-        # evaluation can A/B the prompts through one code path.
+        # The prompt asks for "mesh"; models also answer "mesh_candidates"
+        # (the original prompt's field), so accept both.
         headings = _strs(c.get("mesh") or c.get("mesh_candidates"))
         clean.append({
             "name": str(c.get("name", "")).strip(),

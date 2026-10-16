@@ -26,7 +26,9 @@ tool -- built independently here via simple conjunction/punctuation chunking
 rather than MeSH span-matching.
 
 `segment` is the entry point: k calls to `_one_llm_pass`, each parsed by
-`_parse_facet_response`, then voted by `_vote_or_fallback`.
+`_parse_facet_response`, then voted by `_vote_or_fallback`. When the host
+agent is the model, `facet_messages` gives it the exact prompt and
+`segment_from_samples` runs its k answers through the same parse and vote.
 """
 from __future__ import annotations
 
@@ -171,7 +173,10 @@ def _extract_json(content: str) -> dict:
     start, end = content.find("{"), content.rfind("}")
     if start == -1 or end == -1:
         raise FacetLLMError(f"No JSON object in facet response: {content[:200]}")
-    return json.loads(content[start:end + 1])
+    try:
+        return json.loads(content[start:end + 1])
+    except json.JSONDecodeError as e:
+        raise FacetLLMError(f"Malformed JSON in facet response: {e}") from e
 
 
 VALID_PICO_ROLES = frozenset(
@@ -228,6 +233,13 @@ def _parse_facet_response(question: str, content: str) -> list[dict]:
     return out
 
 
+def facet_messages(question: str) -> list[dict]:
+    """The chat messages one segmentation sample is answered from -- the same
+    for OpenRouter and for a host agent answering them itself."""
+    return [{"role": "system", "content": FACET_SYSTEM_PROMPT},
+            {"role": "user", "content": question}]
+
+
 def _one_llm_pass(question: str, *, model: str | None, api_key: str | None,
                    seed: int) -> list[dict]:
     """One synchronous facet-segmentation sample. Raises FacetLLMError on any
@@ -243,10 +255,7 @@ def _one_llm_pass(question: str, *, model: str | None, api_key: str | None,
         "temperature": FACET_TEMPERATURE,
         "seed": seed,
         "max_tokens": FACET_MAX_TOKENS,
-        "messages": [
-            {"role": "system", "content": FACET_SYSTEM_PROMPT},
-            {"role": "user", "content": question},
-        ],
+        "messages": facet_messages(question),
     }
     if provider["url"] != _PROVIDERS["hf"]["url"]:
         # HF's router can 422 on the plain json_object mode depending on which
@@ -357,6 +366,22 @@ def segment(question: str, *, model: str | None = None, api_key: str | None = No
     for i in range(max(1, k)):
         try:
             runs.append(_one_llm_pass(question, model=model, api_key=api_key, seed=1000 + i))
+        except FacetLLMError as e:
+            errors.append(str(e))
+    return _vote_or_fallback(question, runs, errors, min_agreement)
+
+
+def segment_from_samples(question: str, samples: list[str],
+                         min_agreement: float = 0.5) -> dict:
+    """k-sample segmentation from answers the caller already has -- the host
+    agent answering facet_messages() itself instead of an OpenRouter call.
+    Each answer goes through the same _parse_facet_response and the same vote
+    as segment(); an unparseable answer is a failed sample, as it is there."""
+    runs: list[list[dict]] = []
+    errors: list[str] = []
+    for content in samples:
+        try:
+            runs.append(_parse_facet_response(question, content))
         except FacetLLMError as e:
             errors.append(str(e))
     return _vote_or_fallback(question, runs, errors, min_agreement)

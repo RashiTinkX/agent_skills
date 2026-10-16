@@ -34,8 +34,20 @@ Usage:
     python generate_search_strategy.py "..." --fetch 5000 --outdir searches/
     python generate_search_strategy.py "..." --json > strategy.json
 
+The host agent as the model (Claude Code, Codex, ...: no API key). The script
+prints the exact prompt it would send; the agent answers it itself and hands
+the answers back, and they go through the same parsing and voting:
+
+    python generate_search_strategy.py "..." --emit-prompt > prompt.json
+    #   closure: answer prompt.json's messages k times, independently, and save
+    #   the k JSON answers as a list in samples.json
+    python generate_search_strategy.py "..." --facet-samples samples.json \\
+        --model-name <your model id> --count
+    #   llm mode: --mode llm --emit-prompt, one answer, then --llm-response FILE
+
 Environment:
-    OPENROUTER_API_KEY   required by every mode except mesh_only
+    OPENROUTER_API_KEY   only when the script calls the model itself; not needed
+                         with --facet-samples / --llm-response or --mode mesh_only
     OPENROUTER_MODEL     default model (else anthropic/claude-3.5-sonnet)
     NCBI_API_KEY         optional; raises the E-utilities rate limit
     NCBI_EMAIL           optional; NCBI asks for a contact address
@@ -53,10 +65,43 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from search_strategy import build_index, pipeline, query_builder  # noqa: E402
+from search_strategy import build_index, facets, pipeline, query_builder  # noqa: E402
 from search_strategy.mesh_index import DEFAULT_DB  # noqa: E402
-from search_strategy.openrouter_client import OpenRouterError  # noqa: E402
+from search_strategy.openrouter_client import OpenRouterError, propose_messages  # noqa: E402
 from search_strategy.pubmed import PubMed, to_csv, to_jsonl  # noqa: E402
+
+
+def _emit_prompt(args: argparse.Namespace) -> dict:
+    """What the host agent answers when it is the model (--emit-prompt)."""
+    if args.mode == "closure":
+        messages, n, flag = facets.facet_messages(args.question), args.facet_runs, "--facet-samples"
+        save = (f"a JSON list of the {n} answers, each answered independently "
+                "(a fresh context per sample, e.g. one subagent each)")
+    else:
+        messages, n, flag = (propose_messages(args.question, args.domains or None,
+                                              args.extra_context), 1, "--llm-response")
+        save = "the one answer, as a JSON file"
+    return {
+        "mode": args.mode,
+        "question": args.question,
+        "samples_needed": n,
+        "messages": messages,
+        "answer": "Answer the messages as the model would: the JSON object only, no prose.",
+        "save_as": save,
+        "next": (f'generate_search_strategy.py "<question>" --mode {args.mode} {flag} FILE '
+                 "--model-name <your model id>"),
+    }
+
+
+def _load_samples(path: str) -> list[str]:
+    """--facet-samples: a JSON list of answers (objects or JSON strings), or
+    {"samples": [...]}."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        data = data.get("samples")
+    if not isinstance(data, list) or not data:
+        raise ValueError(f"{path}: expected a non-empty JSON list of answers")
+    return [s if isinstance(s, str) else json.dumps(s) for s in data]
 
 
 def _filters(args: argparse.Namespace) -> dict:
@@ -144,6 +189,15 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     ap.add_argument("--build-index", default="", metavar="MESH_NT",
                     help="build the local MeSH index from an NLM mesh.nt dump and exit")
+    # the host agent as the model
+    ap.add_argument("--emit-prompt", action="store_true",
+                    help="print the prompt for the host agent to answer, and exit")
+    ap.add_argument("--facet-samples", default="", metavar="FILE",
+                    help="closure: the agent's k answers to --emit-prompt (JSON list)")
+    ap.add_argument("--llm-response", default="", metavar="FILE",
+                    help="llm mode: the agent's answer to --emit-prompt")
+    ap.add_argument("--model-name", default="", metavar="ID",
+                    help="the model that wrote --facet-samples / --llm-response (provenance)")
     args = ap.parse_args()
 
     if args.build_index:
@@ -151,6 +205,18 @@ def main() -> int:
         return 0
     if not args.question.strip():
         ap.error("a question is required (or use --build-index)")
+    if args.emit_prompt:
+        if args.mode == "mesh_only":
+            ap.error("--mode mesh_only uses no model; there is no prompt to answer")
+        print(json.dumps(_emit_prompt(args), indent=2))
+        return 0
+    if args.facet_samples and args.mode != "closure":
+        ap.error("--facet-samples is for --mode closure")
+    if args.llm_response and args.mode != "llm":
+        ap.error("--llm-response is for --mode llm")
+    agent = bool(args.facet_samples or args.llm_response)
+    if agent and args.provider != "openrouter":
+        ap.error("--provider is for calling a model; with agent answers no model is called")
     if not os.path.exists(DEFAULT_DB) or os.path.getsize(DEFAULT_DB) == 0:
         print(f"MeSH index not found at {DEFAULT_DB}.\n"
               "Download https://nlmpubs.nlm.nih.gov/projects/mesh/rdf/2026/mesh2026.nt.gz, gunzip it, "
@@ -165,29 +231,55 @@ def main() -> int:
         model_label = f"codex/{os.environ.get('CODEX_MODEL') or 'default'}"
 
     try:
+        samples = _load_samples(args.facet_samples) if args.facet_samples else None
+        response = (Path(args.llm_response).read_text(encoding="utf-8")
+                    if args.llm_response else None)
         built = pipeline.build(
             args.question, domains=args.domains or None, mode=args.mode, model=args.model,
             extra_context=args.extra_context,
             strict=not args.no_strict, facet_runs=args.facet_runs,
+            facet_samples=samples, llm_response=response,
         )
     except OpenRouterError as e:
-        print(f"LLM call failed: {e}\n(--mode mesh_only needs no LLM)", file=sys.stderr)
+        if agent:
+            print(f"Could not parse the answer in {args.llm_response}: {e}", file=sys.stderr)
+        else:
+            print(f"LLM call failed: {e}\n(--mode mesh_only needs no LLM; inside an agent, "
+                  "use --emit-prompt and answer it yourself)", file=sys.stderr)
         return 1
+    except (OSError, ValueError) as e:
+        print(f"Could not read the agent's answers: {e}", file=sys.stderr)
+        return 1
+
+    no_model = built["mode"] == "closure" and built["segmentation"].get("mode") == "heuristic"
+    if no_model:
+        print("note: no model was called (OPENROUTER_API_KEY not set); facets come from the "
+              "offline heuristic segmenter.\nInside an agent, run --emit-prompt and answer it "
+              "yourself (--facet-samples).", file=sys.stderr)
+    if built["mode"] == "mesh_only" or no_model:
+        provider, model = "none", ""
+    elif agent:
+        provider, model = "agent", args.model_name or "unspecified"
+    else:
+        # TEMP-CODEX: model_label -- the engine does not know Codex answered
+        provider, model = args.provider, model_label or args.model or facets.DEFAULT_MODEL
 
     filters = _filters(args)
     compiled = query_builder.compile_search(built["concepts"], filters)
     result = {
         "question": args.question,
         "mode": built["mode"],
-        "provider": args.provider,
-        # TEMP-CODEX: the engine reports $OPENROUTER_MODEL even when Codex answered
-        "model": model_label if model_label and built["mode"] != "mesh_only" else built["model"],
+        "provider": provider,
+        "model": model,
         "notes": built["notes"],
         "concepts": built["concepts"],
         "dropped": built["dropped"],
         "filters": filters,
         **compiled,
     }
+    if built["mode"] == "closure":
+        # the voted spans the vocabulary was resolved from (and how many samples agreed)
+        result["segmentation"] = built["segmentation"]
 
     if args.count or args.fetch is not None:
         pm = _pubmed()
@@ -202,9 +294,13 @@ def main() -> int:
         print(json.dumps(result, indent=2))
         return 0
 
-    print(f"mode: {result['mode']}   model: {result['model'] or '-'}")
+    print(f"mode: {result['mode']}   provider: {result['provider']}   "
+          f"model: {result['model'] or '-'}")
     if result["notes"]:
         print(f"notes: {result['notes']}")
+    for f in result.get("segmentation", {}).get("facets", []):
+        votes = f" ({f['agreement']}/{f['of']} samples)" if "agreement" in f else ""
+        print(f"  span [{f['role']}] {f['name']!r}{votes}")
     for i, c in enumerate(result["concepts"], 1):
         mesh = "; ".join(c["mesh"]) or "-"
         print(f"  block {i} [{c['slot']}] {c['name']}: MeSH {mesh}  (+{len(c['freetext'])} text terms)")
