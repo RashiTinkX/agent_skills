@@ -193,6 +193,38 @@ class IndexBuildTests(unittest.TestCase):
         self.assertEqual(terms, {"Calcimycin", "A23187"})
         self.assertEqual(trees, ["D03.633.100.221.173"])
 
+    def test_builds_to_a_bare_filename(self):
+        old = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.build_index.build(str(self._gz()), "bare.sqlite")
+            self.assertEqual(self.build_index.index_descriptors("bare.sqlite"), 1)
+        finally:
+            os.chdir(old)
+
+    def test_failed_write_leaves_no_partial_file(self):
+        db = self.dir / "mesh.sqlite"
+        real = sqlite3.connect
+
+        class Full:                      # a connection whose writes fail, like a full disk
+            def __init__(self, path):
+                self._c = real(path)
+
+            def executescript(self, sql):
+                raise sqlite3.OperationalError("database or disk is full")
+
+            def close(self):
+                self._c.close()
+
+        self.build_index.sqlite3.connect = Full
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(sqlite3.Error):
+                self.build_index.build(str(self._gz()), str(db))
+        finally:
+            self.build_index.sqlite3.connect = real
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["mesh_fixture.nt.gz"])
+
     def test_missing_or_partial_index_counts_as_absent(self):
         self.assertEqual(self.build_index.index_descriptors(str(self.dir / "none.sqlite")), 0)
         empty = self.dir / "empty.sqlite"

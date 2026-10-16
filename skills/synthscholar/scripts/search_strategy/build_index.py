@@ -130,7 +130,7 @@ def _parse_line(line: str):
 def build(nt_path: str, db_path: str) -> None:
     if not os.path.exists(nt_path):
         sys.exit(f"MeSH N-Triples file not found: {nt_path}")
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)   # a bare filename is cwd
 
     t0 = time.time()
     desc_label: dict[str, str] = {}
@@ -187,16 +187,6 @@ def build(nt_path: str, db_path: str) -> None:
     tmp_path = db_path + ".building"
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
-    con = sqlite3.connect(tmp_path)
-    con.executescript(
-        """
-        PRAGMA journal_mode = OFF;
-        PRAGMA synchronous = OFF;
-        CREATE TABLE descriptor (dui TEXT PRIMARY KEY, label TEXT, label_norm TEXT);
-        CREATE TABLE tree (dui TEXT, tree TEXT);
-        CREATE TABLE entry_term (dui TEXT, term TEXT, term_norm TEXT);
-        """
-    )
 
     desc_rows = []
     tree_rows = []
@@ -218,21 +208,36 @@ def build(nt_path: str, db_path: str) -> None:
         for term in terms:
             et_rows.append((dui, term, norm(term)))
 
-    con.executemany("INSERT OR REPLACE INTO descriptor VALUES (?,?,?)", desc_rows)
-    con.executemany("INSERT INTO tree VALUES (?,?)", tree_rows)
-    con.executemany("INSERT INTO entry_term VALUES (?,?,?)", et_rows)
-    con.executescript(
-        """
-        CREATE INDEX idx_desc_norm  ON descriptor(label_norm);
-        CREATE INDEX idx_tree_tree  ON tree(tree);
-        CREATE INDEX idx_tree_dui   ON tree(dui);
-        CREATE INDEX idx_et_dui     ON entry_term(dui);
-        CREATE INDEX idx_et_norm    ON entry_term(term_norm);
-        """
-    )
-    con.commit()
-    con.execute("VACUUM")
-    con.commit()
+    con = sqlite3.connect(tmp_path)
+    try:
+        con.executescript(
+            """
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            CREATE TABLE descriptor (dui TEXT PRIMARY KEY, label TEXT, label_norm TEXT);
+            CREATE TABLE tree (dui TEXT, tree TEXT);
+            CREATE TABLE entry_term (dui TEXT, term TEXT, term_norm TEXT);
+            """
+        )
+        con.executemany("INSERT OR REPLACE INTO descriptor VALUES (?,?,?)", desc_rows)
+        con.executemany("INSERT INTO tree VALUES (?,?)", tree_rows)
+        con.executemany("INSERT INTO entry_term VALUES (?,?,?)", et_rows)
+        con.executescript(
+            """
+            CREATE INDEX idx_desc_norm  ON descriptor(label_norm);
+            CREATE INDEX idx_tree_tree  ON tree(tree);
+            CREATE INDEX idx_tree_dui   ON tree(dui);
+            CREATE INDEX idx_et_dui     ON entry_term(dui);
+            CREATE INDEX idx_et_norm    ON entry_term(term_norm);
+            """
+        )
+        con.commit()
+        con.execute("VACUUM")
+        con.commit()
+    except BaseException:
+        con.close()
+        os.remove(tmp_path)              # never leave a half-built index behind
+        raise
     con.close()
     os.replace(tmp_path, db_path)
     print(
@@ -283,6 +288,8 @@ def ensure(db_path: str = DEFAULT_DB, url: str = MESH_URL) -> bool:
         build(gz_path, db_path)
     except (OSError, EOFError, gzip.BadGzipFile) as e:
         raise RuntimeError(f"could not download or read the MeSH dump from {url}: {e}") from e
+    except sqlite3.Error as e:               # e.g. a full disk while writing the index
+        raise RuntimeError(f"could not write the MeSH index at {db_path}: {e}") from e
     finally:
         if os.path.exists(gz_path):
             os.remove(gz_path)
