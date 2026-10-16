@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import gzip
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -185,6 +186,140 @@ class IndexBuildTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
             self.build_index.ensure(str(db), url=(self.dir / "absent.nt.gz").as_uri())
         self.assertEqual(list(self.dir.iterdir()), [])
+
+
+class ScreeningTests(unittest.TestCase):
+    """screen_records.py: search results -> agent decisions -> corpus.json,
+    screening log and PRISMA counts."""
+
+    def setUp(self):
+        import screen_records
+        self.sr = screen_records
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        rows = [{"pmid": str(100 + i), "doi": f"10.1/x{i}", "title": f"Trial {i}",
+                 "authors": "Doe J; Roe R", "journal": "J", "year": "2024",
+                 "abstract": "MBSR and anxiety.", "pub_types": "Journal Article",
+                 "mesh_terms": "Anxiety; Mindfulness"} for i in range(5)]
+        rows.append(dict(rows[0]))                       # duplicate PMID: dropped
+        self.results = self.dir / "results.jsonl"
+        self.results.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        self.protocol = self.dir / "protocol.json"
+        self.protocol.write_text(json.dumps({
+            "objective": "MBSR for anxiety", "inclusion_criteria": "RCTs of MBSR",
+            "exclusion_criteria": "reviews"}), encoding="utf-8")
+        self.work = self.dir / "screening"
+        self.prov = self.dir / "search_provenance.json"
+        self.prov.write_text(json.dumps({"searches": [], "total_identified": 5}), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, *argv) -> int:
+        old = sys.argv
+        sys.argv = ["screen_records.py", *map(str, argv)]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                return self.sr.main()
+        finally:
+            sys.argv = old
+
+    def _plan(self):
+        return self._run("plan", self.results, "--protocol", self.protocol,
+                         "--workdir", self.work, "--batch-size", 2)
+
+    def _decide(self, n: int, rows: list[dict]):
+        (self.work / f"decisions_{n:03d}.json").write_text(
+            json.dumps({"decisions": rows}), encoding="utf-8")
+
+    def _decide_all(self):
+        self._decide(1, [{"pmid": "100", "decision": "include", "reason": "RCT of MBSR"},
+                         {"pmid": "101", "decision": "exclude", "reason": "exclusion: review"}])
+        self._decide(2, [{"pmid": "102", "decision": "unsure", "reason": ""},
+                         {"pmid": "103", "decision": "exclude", "reason": "inclusion: not MBSR"}])
+        self._decide(3, [{"pmid": "104", "decision": "include", "reason": "RCT"}])
+
+    def test_plan_batches_records_once(self):
+        self.assertEqual(self._plan(), 0)
+        plan = json.loads((self.work / "plan.json").read_text(encoding="utf-8"))
+        self.assertEqual((plan["n_records"], plan["n_batches"]), (5, 3))
+        self.assertEqual(self._run("status", "--workdir", self.work), 1)   # nothing decided
+
+    def test_plan_needs_eligibility_criteria(self):
+        self.protocol.write_text(json.dumps({"objective": "x"}), encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            self._plan()
+
+    def test_invalid_decisions_are_rejected(self):
+        self._plan()
+        bad = {
+            "missing pmid": [{"pmid": "100", "decision": "include", "reason": ""}],
+            "unknown pmid": [{"pmid": "999", "decision": "include", "reason": ""}],
+            "bad value": [{"pmid": "100", "decision": "maybe", "reason": ""},
+                          {"pmid": "101", "decision": "include", "reason": ""}],
+            "exclude without reason": [{"pmid": "100", "decision": "exclude", "reason": ""},
+                                       {"pmid": "101", "decision": "include", "reason": ""}],
+        }
+        for label, rows in bad.items():
+            with self.subTest(label):
+                self._decide(1, rows)
+                state, _ = self.sr._check_batch(self.work, 1)
+                self.assertTrue(state.startswith("invalid"), state)
+
+    def test_apply_keeps_include_and_unsure_and_counts(self):
+        self._plan()
+        self._decide_all()
+        self.assertEqual(self._run("status", "--workdir", self.work), 0)
+        corpus = self.dir / "corpus.json"
+        self.assertEqual(self._run("apply", "--workdir", self.work, "--corpus-out", corpus,
+                                   "--provenance", self.prov, "--model-name", "test-model"), 0)
+        data = json.loads(corpus.read_text(encoding="utf-8"))
+        self.assertEqual([i["pmid"] for i in data["items"]], ["100", "102", "104"])
+        self.assertEqual(data["provenance"], "pubmed_search_screened")
+        self.assertEqual(data["items"][0]["source"], "PubMed")
+        self.assertEqual(data["items"][0]["mesh_terms"], ["Anxiety", "Mindfulness"])
+        prov = json.loads(self.prov.read_text(encoding="utf-8"))
+        self.assertEqual((prov["records_screened"], prov["records_excluded_title_abstract"],
+                          prov["reports_sought"]), (5, 2, 3))
+        log = [json.loads(line) for line in
+               (self.work / "screening_log.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(log), 5)
+        self.assertTrue(all(r["screened_by"] == "test-model" for r in log))
+
+    def test_apply_refuses_incomplete_or_changed_input(self):
+        self._plan()
+        self._decide(1, [{"pmid": "100", "decision": "include", "reason": ""},
+                         {"pmid": "101", "decision": "include", "reason": ""}])
+        with self.assertRaises(SystemExit):           # batches 2 and 3 not decided
+            self._run("apply", "--workdir", self.work, "--corpus-out", self.dir / "c.json")
+        self._decide_all()
+        with self.results.open("a", encoding="utf-8") as fh:
+            fh.write("\n" + json.dumps({"pmid": "999", "title": "late"}))
+        with self.assertRaises(SystemExit):           # results changed since plan
+            self._run("apply", "--workdir", self.work, "--corpus-out", self.dir / "c.json")
+
+
+class SearchProvenanceTests(unittest.TestCase):
+    def test_provenance_from_a_run(self):
+        import generate_search_strategy as gss
+        filters = {"date_from": "2015", "date_to": "2024/06/30", "languages": ["english"],
+                   "article_types_include": [], "article_types_exclude": ["Review"],
+                   "species": "humans", "exclude_terms": []}
+        prov = gss._search_provenance({
+            "mode": "closure", "provider": "agent", "model": "claude-opus-5-5",
+            "query": "(x) AND (y)", "hash": "abc123", "count": 78, "filters": filters,
+            "fetch": {"fetched": 78, "total_count": 78, "capped": False,
+                      "records_unaccounted": 0}})
+        s = prov["searches"][0]
+        self.assertEqual((s["database"], s["query"], s["records_identified"]),
+                         ("PubMed", "(x) AND (y)", 78))
+        self.assertIn("abc123", s["notes"])
+        self.assertIn("agent claude-opus-5-5", s["notes"])
+        self.assertIn("excluding publication type: Review", s["filters"])
+        self.assertEqual((prov["total_identified"], prov["duplicates_removed"]), (78, 0))
+        self.assertEqual((prov["date_range_start"], prov["date_range_end"]),
+                         ("2015", "2024-06-30"))
 
 
 @needs_index
