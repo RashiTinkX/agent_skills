@@ -383,6 +383,48 @@ class ScreeningTests(unittest.TestCase):
             self._run("apply", "--workdir", self.work, "--corpus-out", self.dir / "c.json")
 
 
+class DateSlicingTests(unittest.TestCase):
+    """PubMed's history server refuses retstart > 9,998, so a bigger search is
+    split by publication date. Checked against a fake PubMed: no network."""
+
+    def _fake(self, dates):
+        import re as _re
+        from datetime import date as _date
+        from search_strategy.pubmed import PubMed
+
+        class Fake(PubMed):
+            def __init__(self):            # no HTTP session
+                pass
+
+            def count(self, query):
+                found = _re.findall(r'"(\d{4})/(\d{2})/(\d{2})"', query)
+                if not found:
+                    return len(dates)
+                lo, hi = (_date(*map(int, f)) for f in found)
+                return sum(1 for d in dates if lo <= d <= hi)
+        return Fake()
+
+    def test_slices_are_disjoint_complete_and_under_the_limit(self):
+        from datetime import date, timedelta
+        dates = [date(2010, 1, 1) + timedelta(days=i % 4000) for i in range(40_000)]
+        dates += [date(2021, 5, 5)] * 12_000      # one day over the limit on its own
+        slices = self._fake(dates).date_partitions("q")
+        self.assertEqual(sum(s["count"] for s in slices), len(dates))
+        spans = [(s["from"], s["to"]) for s in slices]
+        self.assertEqual(spans, sorted(spans))
+        for (a1, b1), (a2, b2) in zip(spans, spans[1:]):
+            self.assertLess(b1, a2)                # disjoint, in order
+        over = [s for s in slices if s["count"] > 9_999]
+        self.assertEqual([(s["from"], s["truncated"]) for s in over], [("2021/05/05", True)])
+        self.assertTrue(all(not s["truncated"] for s in slices if s["count"] <= 9_999))
+
+    def test_slicing_is_deterministic(self):
+        from datetime import date, timedelta
+        dates = [date(2000, 1, 1) + timedelta(days=(i * 7) % 9000) for i in range(25_000)]
+        pm = self._fake(dates)
+        self.assertEqual(pm.date_partitions("q"), pm.date_partitions("q"))
+
+
 class SearchProvenanceTests(unittest.TestCase):
     def test_provenance_from_a_run(self):
         import generate_search_strategy as gss

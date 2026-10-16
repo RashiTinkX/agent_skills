@@ -233,7 +233,9 @@ class PubMed:
             slices = [{"from": "", "to": "", "count": total, "query": query,
                        "truncated": False}]
         else:
-            slices = self.date_partitions(query, progress=progress)
+            # `progress` is fetch_all's (done, target) callback; date_partitions
+            # calls its own with (lo, hi, n), so it is not passed on
+            slices = self.date_partitions(query)
 
         articles: list[Article] = []
         seen: set[str] = set()
