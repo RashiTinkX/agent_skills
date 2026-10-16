@@ -121,6 +121,8 @@ def _content(status: int, text: str, url: str) -> str:
 
 
 def _strs(seq) -> list[str]:
+    if isinstance(seq, str):          # one term given as a bare string, not a list
+        seq = [seq]
     return [str(x).strip() for x in (seq or []) if str(x).strip()]
 
 
@@ -134,7 +136,10 @@ def parse_proposal(content: str, model: str) -> dict:
     Shared by the OpenRouter path and a host agent's own answer."""
     parsed = _loads_lenient(content)
     clean = []
-    for c in parsed.get("concepts", []):
+    concepts = parsed.get("concepts") if isinstance(parsed, dict) else None
+    if not isinstance(concepts, list):
+        raise OpenRouterError('LLM answer has no "concepts" list')
+    for c in concepts:
         if not isinstance(c, dict):
             continue
         # The prompt asks for "mesh"; models also answer "mesh_candidates"

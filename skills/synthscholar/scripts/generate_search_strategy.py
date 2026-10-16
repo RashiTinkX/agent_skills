@@ -340,7 +340,8 @@ def main() -> int:
                   "use --emit-prompt and answer it yourself)", file=sys.stderr)
         return 1
     except (OSError, ValueError) as e:
-        print(f"Could not read the agent's answers: {e}", file=sys.stderr)
+        what = "read the agent's answers" if agent else "build the concept blocks"
+        print(f"Could not {what}: {e}", file=sys.stderr)
         return 1
 
     seg = built["segmentation"] if built["mode"] == "closure" else {}
@@ -372,7 +373,13 @@ def main() -> int:
         provider, model = args.provider, model_label or args.model or facets.DEFAULT_MODEL
 
     filters = _filters(args)
-    compiled = query_builder.compile_search(built["concepts"], filters)
+    try:
+        compiled = query_builder.compile_search(built["concepts"], filters)
+    except ValueError as e:
+        print(f"No query could be compiled: {str(e).rstrip('.')}. No concept in the question matched MeSH "
+              "or yielded search terms; rephrase it with the concepts named explicitly"
+              + (", or re-answer --emit-prompt" if agent else "") + ".", file=sys.stderr)
+        return 1
     result = {
         "question": args.question,
         "mode": built["mode"],
@@ -394,12 +401,17 @@ def main() -> int:
 
     if args.count or args.fetch is not None or args.provenance_out:
         pm = _pubmed()
-        search = pm.search(compiled["query"])
-        result.update(count=search["count"], translation=search["translation"],
-                      warnings=search["warnings"], errors=search["errors"])
-        if args.fetch is not None and search["count"]:
-            result["fetch"] = _fetch(pm, compiled["query"], search, args.fetch,
-                                     Path(args.outdir))
+        try:
+            search = pm.search(compiled["query"])
+            result.update(count=search["count"], translation=search["translation"],
+                          warnings=search["warnings"], errors=search["errors"])
+            if args.fetch is not None and search["count"]:
+                result["fetch"] = _fetch(pm, compiled["query"], search, args.fetch,
+                                         Path(args.outdir))
+        except (OSError, RuntimeError) as e:     # requests errors are OSErrors
+            print(f"PubMed request failed: {e}\nThe query compiled (hash {compiled['hash']}); "
+                  "retry later, or set NCBI_API_KEY for a higher rate limit.", file=sys.stderr)
+            return 3
     if args.provenance_out:
         Path(args.provenance_out).write_text(
             json.dumps(_search_provenance(result), indent=2), encoding="utf-8")

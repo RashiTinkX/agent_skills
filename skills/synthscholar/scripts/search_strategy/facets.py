@@ -217,8 +217,11 @@ def _parse_facet_response(question: str, content: str) -> list[dict]:
     than guessed at (see _locate_span); role is sanitized via
     _normalize_pico_role rather than trusted as-is."""
     parsed = _extract_json(content)
+    facets = parsed.get("facets") if isinstance(parsed, dict) else None
+    if not isinstance(facets, list):
+        raise FacetLLMError('facet response has no "facets" list')
     out = []
-    for f in parsed.get("facets", []):
+    for f in facets:
         if not isinstance(f, dict):
             continue
         text = str(f.get("text", "")).strip()
@@ -268,10 +271,17 @@ def _one_llm_pass(question: str, *, model: str | None, api_key: str | None,
     if provider["url"] == OPENROUTER_URL:
         headers["HTTP-Referer"] = "http://localhost"
         headers["X-Title"] = "Deterministic Search - facets"
-    r = requests.post(provider["url"], headers=headers, json=payload, timeout=TIMEOUT)
-    if r.status_code != 200:
-        raise FacetLLMError(f"LLM {r.status_code}: {r.text[:300]}")
-    content = r.json()["choices"][0]["message"]["content"]
+    # a network error or a malformed reply is one failed sample, not a failed run
+    # (requests.RequestException is an OSError)
+    try:
+        r = requests.post(provider["url"], headers=headers, json=payload, timeout=TIMEOUT)
+        if r.status_code != 200:
+            raise FacetLLMError(f"LLM {r.status_code}: {r.text[:300]}")
+        content = r.json()["choices"][0]["message"]["content"]
+    except FacetLLMError:
+        raise
+    except (OSError, ValueError, KeyError, IndexError, TypeError) as e:
+        raise FacetLLMError(f"LLM request failed ({provider['url']}): {e}") from e
     return _parse_facet_response(question, content)
 
 

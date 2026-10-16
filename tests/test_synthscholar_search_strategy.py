@@ -120,6 +120,30 @@ class AgentSamplesTests(unittest.TestCase):
         self.assertEqual(got["runs"], 1)
         self.assertEqual(len(got["errors"]), 2)
 
+    def test_null_facets_is_a_failed_sample(self):
+        got = facets.segment_from_samples(self.Q, ['{"facets": null}', self.ANSWER])
+        self.assertEqual((got["mode"], got["runs"], len(got["errors"])), ("llm_voted", 1, 1))
+
+    def test_transport_error_is_one_failed_sample(self):
+        def boom(*a, **k):
+            raise OSError("connection refused")      # requests' errors are OSErrors
+        old = getattr(facets.requests, "post", None)
+        facets.requests.post = boom
+        try:
+            with self.assertRaises(facets.FacetLLMError):
+                facets._one_llm_pass(self.Q, model="ollama/x", api_key=None, seed=1)
+        finally:
+            if old is None:
+                del facets.requests.post
+            else:
+                facets.requests.post = old
+
+    def test_llm_answer_shapes(self):
+        from search_strategy import openrouter_client as oc
+        self.assertEqual(oc._strs("Anxiety"), ["Anxiety"])
+        with self.assertRaises(oc.OpenRouterError):
+            oc.parse_proposal('{"concepts": "oops"}', "m")
+
     def test_prompt_is_the_one_sent_to_openrouter(self):
         messages = facets.facet_messages(self.Q)
         self.assertEqual(messages[0], {"role": "system", "content": facets.FACET_SYSTEM_PROMPT})
@@ -475,6 +499,24 @@ class SegmentationFallbackTests(unittest.TestCase):
         result.update(count=1, filters=result["filters"])
         notes = self.gss._search_provenance(result)["searches"][0]["notes"]
         self.assertIn("model segmentation FAILED", notes)
+
+    def test_no_query_is_a_clear_error(self):
+        code, out, err = self._main("xqzzy blorft", "--mode", "mesh_only")
+        self.assertEqual(code, 1)
+        self.assertIn("No query could be compiled", err)
+
+    def test_pubmed_failure_is_a_clear_error(self):
+        class Down:
+            def search(self, query):
+                raise RuntimeError("E-utilities request failed after retries")
+        old = self.gss._pubmed
+        self.gss._pubmed = lambda: Down()
+        try:
+            code, out, err = self._main(self.Q, "--mode", "mesh_only", "--count")
+        finally:
+            self.gss._pubmed = old
+        self.assertEqual(code, 3)
+        self.assertIn("PubMed request failed", err)
 
 
 @needs_index
