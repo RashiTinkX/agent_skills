@@ -39,6 +39,7 @@ Environment:
     OPENROUTER_MODEL     default model (else anthropic/claude-3.5-sonnet)
     NCBI_API_KEY         optional; raises the E-utilities rate limit
     NCBI_EMAIL           optional; NCBI asks for a contact address
+    CODEX_BIN, CODEX_MODEL  TEMP-CODEX: --provider codex only (codex_shim.py)
 
 Requires ``requests``.
 """
@@ -113,6 +114,9 @@ def main() -> int:
     ap.add_argument("--mode", default="closure", choices=pipeline.MODES,
                     help="mapping mode (default: closure)")
     ap.add_argument("--model", default=None, help="model id (default: $OPENROUTER_MODEL)")
+    # TEMP-CODEX: answer the LLM calls with the local Codex CLI (codex_shim.py)
+    ap.add_argument("--provider", default="openrouter", choices=("openrouter", "codex"),
+                    help="who answers the LLM calls (default openrouter; codex is temporary)")
     ap.add_argument("--facet-runs", type=int, default=3, metavar="K",
                     help="closure mode: samples for self-consistency voting (default 3)")
     ap.add_argument("--domains", nargs="*", default=[],
@@ -154,6 +158,12 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    model_label = None
+    if args.provider == "codex":  # TEMP-CODEX
+        from search_strategy import codex_shim
+        codex_shim.install()
+        model_label = f"codex/{os.environ.get('CODEX_MODEL') or 'default'}"
+
     try:
         built = pipeline.build(
             args.question, domains=args.domains or None, mode=args.mode, model=args.model,
@@ -169,7 +179,9 @@ def main() -> int:
     result = {
         "question": args.question,
         "mode": built["mode"],
-        "model": built["model"],
+        "provider": args.provider,
+        # TEMP-CODEX: the engine reports $OPENROUTER_MODEL even when Codex answered
+        "model": model_label if model_label and built["mode"] != "mesh_only" else built["model"],
         "notes": built["notes"],
         "concepts": built["concepts"],
         "dropped": built["dropped"],
