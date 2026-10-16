@@ -49,12 +49,9 @@ def _resolve_provider(model: str) -> tuple[dict, str]:
             return PROVIDERS[prefix], rest
     return _OPENROUTER, model
 
-from .prompts import PROPOSE_PROMPTS, PROPOSE_V1
+from .prompts import PROPOSE_V2
 
-# Kept for back-compat: the original single prompt. New callers pass
-# prompt_version="v2" (see prompts.py for why the rules changed).
-SYSTEM_PROMPT = PROPOSE_V1
-DEFAULT_PROMPT_VERSION = os.environ.get("PROMPT_VERSION", "v2")
+SYSTEM_PROMPT = PROPOSE_V2
 
 
 class OpenRouterError(RuntimeError):
@@ -143,13 +140,6 @@ def _parse_response(status: int, text: str, url: str, model: str) -> dict:
     return {"concepts": clean, "notes": str(parsed.get("notes", "")).strip(), "model": model}
 
 
-def _system_for(prompt_version: str | None) -> str:
-    v = (prompt_version or DEFAULT_PROMPT_VERSION).lower()
-    if v not in PROPOSE_PROMPTS:
-        raise OpenRouterError(f"Unknown prompt version {v!r} (have: {sorted(PROPOSE_PROMPTS)})")
-    return PROPOSE_PROMPTS[v]
-
-
 def _post_sync(provider, payload, headers):
     try:
         return requests.post(provider["url"], headers=headers, json=payload, timeout=TIMEOUT)
@@ -159,11 +149,10 @@ def _post_sync(provider, payload, headers):
 
 def map_question(question: str, domains: list[str] | None = None,
                  model: str | None = None, api_key: str | None = None,
-                 extra_context: str = "", seed: int | None = None,
-                 prompt_version: str | None = None) -> dict:
+                 extra_context: str = "", seed: int | None = None) -> dict:
     """Synchronous map (used by the determinism evaluation and any sync caller)."""
     provider, payload, headers = _build_request(
-        question, domains, model, extra_context, seed, system=_system_for(prompt_version))
+        question, domains, model, extra_context, seed)
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     r = _post_sync(provider, payload, headers)

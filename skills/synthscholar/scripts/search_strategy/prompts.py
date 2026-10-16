@@ -6,7 +6,7 @@ Design constraint: the LLM's output is not the product — a deterministic progr
 to shrink the model's decision space to the smallest set of choices that still
 needs judgement, and to make those choices the SAME ones a different model would
 make. Every rule below traces to a concrete divergence seen in the 11-model
-evaluation (data/baseline_2026-07-15/determinism.json):
+evaluation (search-strategy-generator's data/baseline_2026-07-15/determinism.json):
 
   * models emitted 1-7 blocks for the same question   -> hard block budget, and
     an explicit ban on the block types that were invented (study design,
@@ -21,38 +21,8 @@ evaluation (data/baseline_2026-07-15/determinism.json):
     freetext instead"; resolution is now exact-match-only
   * free-text lists differed on every single run      -> free-text is restricted
     to what MeSH lacks; in strict mode the index supplies the synonyms
-
-PROPOSE_V1 is the original prompt, kept verbatim so the evaluation can A/B the
-prompt change against the same pipeline.
 """
 from __future__ import annotations
-
-# --------------------------------------------------------------- v1 (baseline)
-
-PROPOSE_V1 = """You are a biomedical search strategist helping build an EXHAUSTIVE, \
-reproducible PubMed search for a systematic literature review.
-
-Decompose the user's research question into orthogonal CONCEPT BLOCKS (PICO-style: \
-e.g. Population, Intervention/Exposure, Outcome, Method). Blocks are ANDed together; \
-terms within a block are ORed. Aim for high recall — err toward MORE synonyms.
-
-For each concept block provide:
-- "name": short label for the block
-- "mesh_candidates": likely MeSH Descriptor HEADINGS (official controlled-vocabulary \
-terms, e.g. "Neuronal Plasticity", "Magnetic Resonance Imaging"). Give the exact \
-canonical heading you believe exists; do not invent qualifiers.
-- "freetext": free-text title/abstract synonyms, including abbreviations, spelling \
-variants (British/US), plurals, and CURRENT method/tool jargon that MeSH may lack \
-(e.g. "RNA-seq", "scRNA-seq", "connectome", "optogenetics"). These catch articles \
-not yet MeSH-indexed.
-
-Return STRICT JSON only:
-{
-  "concepts": [
-    {"name": "...", "mesh_candidates": ["..."], "freetext": ["..."], "rationale": "..."}
-  ],
-  "notes": "any caveats about scope or ambiguity"
-}"""
 
 # --------------------------------------------------------------- v2 (propose)
 
@@ -126,5 +96,3 @@ Return exactly this shape:
   ],
   "notes": "caveats about scope or ambiguity"
 }"""
-
-PROPOSE_PROMPTS = {"v1": PROPOSE_V1, "v2": PROPOSE_V2}

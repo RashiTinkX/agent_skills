@@ -115,8 +115,6 @@ def main() -> int:
     ap.add_argument("--model", default=None, help="model id (default: $OPENROUTER_MODEL)")
     ap.add_argument("--facet-runs", type=int, default=3, metavar="K",
                     help="closure mode: samples for self-consistency voting (default 3)")
-    ap.add_argument("--prompt-version", default=None, choices=("v1", "v2"),
-                    help="llm mode only")
     ap.add_argument("--domains", nargs="*", default=[],
                     help="domain-vocabulary clusters from data/domain_terms.json")
     ap.add_argument("--extra-context", default="", help="extra guidance for the model")
@@ -159,7 +157,7 @@ def main() -> int:
     try:
         built = pipeline.build(
             args.question, domains=args.domains or None, mode=args.mode, model=args.model,
-            extra_context=args.extra_context, prompt_version=args.prompt_version,
+            extra_context=args.extra_context,
             strict=not args.no_strict, facet_runs=args.facet_runs,
         )
     except OpenRouterError as e:

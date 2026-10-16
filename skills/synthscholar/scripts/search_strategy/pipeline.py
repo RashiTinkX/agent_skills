@@ -161,7 +161,7 @@ def _assemble(blocks: list[dict], domains: list[str] | None, *, strict: bool, ix
 def build(question: str, *, domains: list[str] | None = None, mode: str = "closure",
           model: str | None = None, api_key: str | None = None,
           extra_context: str = "", seed: int | None = None,
-          prompt_version: str | None = None, strict: bool = True,
+          strict: bool = True,
           facet_runs: int = 3) -> dict:
     """Question -> canonical concept blocks (CLI / self-test)."""
     mode = _check_mode(mode)
@@ -173,8 +173,7 @@ def build(question: str, *, domains: list[str] | None = None, mode: str = "closu
         blocks = mesh_only_blocks(question, ix)
     elif mode == "llm":
         raw = map_question(question, domains=domains, model=model, api_key=api_key,
-                           extra_context=extra_context, seed=seed,
-                           prompt_version=prompt_version)
+                           extra_context=extra_context, seed=seed)
         notes = raw.get("notes", "")
         blocks = _blocks_from_concepts(raw["concepts"])
     else:
@@ -184,5 +183,5 @@ def build(question: str, *, domains: list[str] | None = None, mode: str = "closu
 
     res = _assemble(blocks, domains, strict=strict, ix=ix)
     return {**res, "mode": mode, "model": raw.get("model") or model or "",
-            "prompt_version": (prompt_version or "v2") if mode == "llm" else mode,
+            "prompt_version": "v2" if mode == "llm" else mode,
             "notes": notes, "raw": raw}
