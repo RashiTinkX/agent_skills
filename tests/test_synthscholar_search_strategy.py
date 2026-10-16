@@ -343,6 +343,33 @@ class ScreeningTests(unittest.TestCase):
         self.assertEqual(len(log), 5)
         self.assertTrue(all(r["screened_by"] == "test-model" for r in log))
 
+    def test_integer_pmids_and_odd_rows(self):
+        rows = [{"pmid": 555, "title": "Int PMID", "abstract": "a"},
+                {"pmid": " 556 ", "title": "Spaced", "abstract": "b"}]
+        self.results.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        self._plan()
+        self._decide(1, ["not an object"])
+        self.assertTrue(self.sr._check_batch(self.work, 1)[0].startswith("invalid"))
+        self._decide(1, [{"pmid": "555", "decision": "include", "reason": ""},
+                         {"pmid": 556, "decision": "exclude", "reason": "inclusion: x"}])
+        self.assertEqual(self.sr._check_batch(self.work, 1)[0], "done")
+        corpus = self.dir / "corpus.json"
+        self.assertEqual(self._run("apply", "--workdir", self.work, "--corpus-out", corpus), 0)
+        items = json.loads(corpus.read_text(encoding="utf-8"))["items"]
+        self.assertEqual([i["pmid"] for i in items], ["555"])
+
+    def test_apply_from_another_directory(self):
+        old = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            self._run("plan", "results.jsonl", "--protocol", "protocol.json",
+                      "--workdir", "screening", "--batch-size", 2)
+        finally:
+            os.chdir(old)
+        self._decide_all()
+        self.assertEqual(self._run("apply", "--workdir", self.work,
+                                   "--corpus-out", self.dir / "c.json"), 0)
+
     def test_apply_refuses_incomplete_or_changed_input(self):
         self._plan()
         self._decide(1, [{"pmid": "100", "decision": "include", "reason": ""},

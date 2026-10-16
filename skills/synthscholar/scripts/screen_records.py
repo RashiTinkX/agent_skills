@@ -81,7 +81,7 @@ def _read_records(path: Path) -> list[dict]:
         pmid = str(row.get("pmid") or "").strip()
         if pmid and pmid not in seen:
             seen.add(pmid)
-            out.append(row)
+            out.append({**row, "pmid": pmid})     # one form everywhere (a JSON number is fine)
     return out
 
 
@@ -103,7 +103,7 @@ def _load_plan(workdir: Path) -> dict:
 def _check_batch(workdir: Path, i: int) -> tuple[str, list[dict]]:
     """('done' | 'missing' | 'invalid: <why>', decisions) for one batch."""
     batch = json.loads((workdir / _batch_name(i)).read_text(encoding="utf-8"))
-    want = [r["pmid"] for r in batch["records"]]
+    want = [str(r["pmid"]).strip() for r in batch["records"]]
     path = workdir / _decisions_name(i)
     if not path.exists():
         return "missing", []
@@ -116,9 +116,11 @@ def _check_batch(workdir: Path, i: int) -> tuple[str, list[dict]]:
         return 'invalid: expected {"decisions": [...]}', []
     got: dict[str, dict] = {}
     for d in rows:
-        pmid = str((d or {}).get("pmid") or "").strip()
-        decision = str((d or {}).get("decision") or "").strip().lower()
-        reason = str((d or {}).get("reason") or "").strip()
+        if not isinstance(d, dict):
+            return f"invalid: each decision must be an object, got {d!r:.60}", []
+        pmid = str(d.get("pmid") or "").strip()
+        decision = str(d.get("decision") or "").strip().lower()
+        reason = str(d.get("reason") or "").strip()
         if pmid not in want:
             return f"invalid: pmid {pmid!r} is not in this batch", []
         if pmid in got:
@@ -166,9 +168,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
         "for_each_batch": "read batch_NNN.json, write decisions_NNN.json (same NNN)",
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     (workdir / "plan.json").write_text(json.dumps({
-        "results": str(results),
+        "results": str(results.resolve()),   # `apply` may run from another directory
+        "protocol": str(Path(args.protocol).resolve()),
         "results_sha256": _sha256(results),
-        "protocol": str(args.protocol),
         "n_records": len(records),
         "batch_size": size,
         "n_batches": len(batches),
